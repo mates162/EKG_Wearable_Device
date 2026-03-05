@@ -105,6 +105,8 @@ FILTER_BANDPASS_ORDER = 4     # řád Butterworth
 NOTCH_QUALITY         = 30    # Q pro úzký zářez
 # Minimální počet vzorků pro stabilní filtrování (filtfilt)
 FILTER_MIN_SAMPLES    = int(SAMPLE_RATE * 1.0)  # alespoň 1 s
+# Délka paddingu na okrajích (vzorky) – větší = méně deformace na začátku/konci, musí být < N-1
+FILTER_EDGE_PAD_SAMPLES = int(SAMPLE_RATE * 1.2)  # 1,2 s na každou stranu
 
 def compute_lsb_mv(gain: int) -> float:
     """Vrátí mV na LSB pro dané PGA gain (vstup i výstup zůstávají v mV)."""
@@ -139,6 +141,11 @@ def apply_ecg_filters(
     if n < FILTER_MIN_SAMPLES:
         return data
 
+    # Délka paddingu na okrajích: sníží deformaci na začátku/konci (filtfilt rozšíří signál)
+    padlen = min(FILTER_EDGE_PAD_SAMPLES, (n - 1) // 2)
+    if padlen < 1:
+        padlen = None  # scipy použije výchozí
+
     out = np.empty_like(data, dtype=np.float64)
     for ch in range(num_ch):
         sig = np.asarray(data[ch], dtype=np.float64)
@@ -149,14 +156,14 @@ def apply_ecg_filters(
         high = min(0.99, bandpass_high / nyq)
         if low < high:
             sos = butter(FILTER_BANDPASS_ORDER, [low, high], btype="band", output="sos")
-            sig = sosfiltfilt(sos, sig, axis=-1)
+            sig = sosfiltfilt(sos, sig, axis=-1, padtype="odd", padlen=padlen)
 
         # 2) Notch 50/60 Hz
         if notch_hz is not None and 0 < notch_hz < nyq:
             w0 = notch_hz / nyq
             if w0 < 0.99 and w0 > 0.01:
                 b, a = iirnotch(notch_hz, NOTCH_QUALITY, fs)
-                sig = filtfilt(b, a, sig, axis=-1)
+                sig = filtfilt(b, a, sig, axis=-1, padtype="odd", padlen=padlen)
 
         out[ch] = sig
 
