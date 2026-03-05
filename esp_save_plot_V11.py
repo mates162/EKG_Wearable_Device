@@ -58,8 +58,18 @@ NUM_CHANNELS    = NUM_RAW_CH + NUM_DERIVED   # 12 total
 WINDOW_SEC      = 10.0               # Seconds of data visible on screen
 WINDOW_SAMPLES  = int(SAMPLE_RATE * WINDOW_SEC)
 
-# Plot refresh interval (ms) — 16 ms ≈ 60 FPS
-PLOT_INTERVAL_MS = 16
+# Plot refresh interval (ms) — menší = plynulejší, 12 ms ≈ 83 FPS
+PLOT_INTERVAL_MS = 12
+# Plynulý posun osy X: 0 = žádné, 1 = okamžitý skok; 0.2–0.35 = plynulé sledování
+SCROLL_SMOOTH_ALPHA = 0.28
+
+# # --- Y_SPAN: zakomentováno kvůli manuálnímu škálování kolečkem myši ---
+# # Minimální rozsah osy Y (mV) pro jeden svod; skutečný rozsah = max(rozsah dat, Y_SPAN_MIN_MV)
+# # → každý kanál se přizpůsobí amplitudě svého signálu, data neklipují
+# Y_SPAN_MIN_MV = 0.5
+# # Volitelně: pevný rozsah pro každý svod (mV), None = auto z dat
+# # Příklad: [2.0, 2.0, 1.5, 1.5, 1.5, 1.5, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0] pro I, II, III, aVR, aVL, aVF, V1–V6
+# Y_SPAN_PER_CHANNEL_MV = None  # nebo seznam 12 čísel
 
 # TCP receive buffer size
 TCP_RECV_SIZE   = 16384
@@ -542,6 +552,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 self.pw.nextRow()
             p = self.pw.addPlot()
             p.setLabel("left", CHANNEL_LABELS[i], units="mV")
+            # Stejná šířka prostoru pro popisky Y u všech grafů → osy vizuálně srovnané
+            p.getAxis("left").setStyle(tickTextWidth=52, autoExpandTextSpace=False)
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMouseEnabled(x=False, y=True)
             p.enableAutoRange(axis="y", enable=True)
@@ -622,6 +634,22 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         )
         controls_layout.addWidget(self.rec_status_label)
 
+        # --- Spacer ---
+        controls_layout.addSpacing(24)
+
+        # --- Pozastavit / Spustit vykreslování ---
+        self._plot_paused = False
+        self.pause_btn = QtWidgets.QPushButton("⏸ Pozastavit vykreslování")
+        self.pause_btn.setFixedWidth(180)
+        self.pause_btn.setCheckable(True)
+        self.pause_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
+            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+            "QPushButton:checked { background: #084; color: #4f4; border: 1px solid #4f4; }"
+        )
+        self.pause_btn.clicked.connect(self._on_pause_toggled)
+        controls_layout.addWidget(self.pause_btn)
+
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
@@ -631,6 +659,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "color: #aaa; font-family: Consolas, monospace; font-size: 12px; padding: 2px;"
         )
         layout.addWidget(self.status_label)
+
+        # --- plynulý posun osy X (aktuální rozsah viewu) ---
+        self._x_view_min = None
+        self._x_view_max = None
 
         # --- refresh timer ---
         self.timer = QtCore.QTimer()
@@ -890,21 +922,62 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         return bpm
 
     # ------------------------------------------------------------------ #
+    def _on_pause_toggled(self):
+        """Zastavit nebo znovu spustit vykreslování grafu."""
+        self._plot_paused = self.pause_btn.isChecked()
+        if self._plot_paused:
+            self.timer.stop()
+            self.pause_btn.setText("▶ Spustit vykreslování")
+        else:
+            self.timer.start(PLOT_INTERVAL_MS)
+            self.pause_btn.setText("⏸ Pozastavit vykreslování")
+
     def _update(self):
         """Called every PLOT_INTERVAL_MS – update curves & status."""
+        if self._plot_paused:
+            return
         t, d, ts_us = self.ring.snapshot()
         if t.size == 0:
+            self._x_view_min = self._x_view_max = None  # reset pro plynulý start po opětovném příjmu
             self._update_status(0, np.array([], dtype=np.uint64), None)
             return
 
+        # Sanitize: nahradit nan/inf konečnými hodnotami, aby PyQtGraph ViewBox nezpůsobil "overflow in cast"
+        t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         for i in range(NUM_CHANNELS):
-            self.curves[i].setData(t, d[i])
+            ch = np.asarray(d[i], dtype=np.float64)
+            ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            self.curves[i].setData(t, ch)
+            # # --- Y_SPAN: zakomentováno – aby fungovalo manuální škálování kolečkem myši ---
+            # # Rozsah Y: buď z Y_SPAN_PER_CHANNEL_MV[i], nebo auto z dat (min. Y_SPAN_MIN_MV)
+            # if ch.size > 0:
+            #     lo, hi = float(np.min(ch)), float(np.max(ch))
+            #     center = (lo + hi) * 0.5
+            #     data_span = hi - lo
+            #     if Y_SPAN_PER_CHANNEL_MV is not None and len(Y_SPAN_PER_CHANNEL_MV) > i:
+            #         span = float(Y_SPAN_PER_CHANNEL_MV[i])
+            #     else:
+            #         span = max(data_span, Y_SPAN_MIN_MV)
+            #     half = span * 0.5
+            #     pad = span * 0.05
+            #     self.plots[i].setYRange(center - half - pad, center + half + pad, padding=0)
 
-        # Scroll X axis to follow newest data
-        t_newest = t[-1]
+        # Plynulý scroll osy X: plynulé přibližování k cílovému rozsahu
+        t_newest = float(t[-1])
         t_oldest = t_newest - WINDOW_SEC
+        if not np.isfinite(t_newest):
+            t_newest = 0.0
+            t_oldest = -WINDOW_SEC
+        if not np.isfinite(t_oldest):
+            t_oldest = t_newest - WINDOW_SEC
+        alpha = SCROLL_SMOOTH_ALPHA
+        if self._x_view_min is None or self._x_view_max is None:
+            self._x_view_min, self._x_view_max = t_oldest, t_newest
+        else:
+            self._x_view_min += alpha * (t_oldest - self._x_view_min)
+            self._x_view_max += alpha * (t_newest - self._x_view_max)
         for p in self.plots:
-            p.setXRange(t_oldest, t_newest, padding=0)
+            p.setXRange(self._x_view_min, self._x_view_max, padding=0)
 
         # Pass full-res Lead I (channel 0) for HR estimation
         self._update_status(t.size, ts_us, d[0] if d.shape[1] > 0 else None)
