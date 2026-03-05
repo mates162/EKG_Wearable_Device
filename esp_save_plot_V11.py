@@ -133,6 +133,65 @@ CSV_HEADER = [
     "gain",
 ]
 
+# Sloupce s kanály (pro načtení CSV) – pořadí musí odpovídat 12 svodům
+CSV_CHANNEL_COLUMNS = [
+    "I_mV", "II_mV", "III_mV", "aVR_mV", "aVL_mV", "aVF_mV",
+    "V1_mV", "V2_mV", "V3_mV", "V4_mV", "V5_mV", "V6_mV",
+]
+
+
+def load_csv(filepath: str):
+    """Načte CSV soubor z aplikace (timestamp_us + 12 kanálů mV).
+    Vrací (time_sec, data) kde time_sec je 1D pole v sekundách od začátku,
+    data má tvar (12, N) v mV. Při chybě vrací None."""
+    try:
+        with open(filepath, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+        if not rows or not fieldnames:
+            return None
+
+        # Sloupec s časem
+        ts_key = "timestamp_us" if "timestamp_us" in fieldnames else None
+        if ts_key is None:
+            for key in fieldnames:
+                if "timestamp" in key.lower():
+                    ts_key = key
+                    break
+        if ts_key is None:
+            return None
+
+        # Sloupce kanálů (12 svodů v pořadí I, II, III, aVR, aVL, aVF, V1–V6)
+        ch_cols = [c for c in CSV_CHANNEL_COLUMNS if c in fieldnames]
+        if len(ch_cols) != NUM_CHANNELS:
+            ch_cols = [c for c in fieldnames if c and c not in ("timestamp_us", "gain")][:NUM_CHANNELS]
+        if len(ch_cols) != NUM_CHANNELS:
+            return None
+
+        ts_list = []
+        ch_arrays = [[] for _ in range(NUM_CHANNELS)]
+        for row in rows:
+            try:
+                t = int(float(row.get(ts_key, 0)))
+            except (ValueError, TypeError):
+                continue
+            ts_list.append(t)
+            for i, col in enumerate(ch_cols):
+                try:
+                    ch_arrays[i].append(float(row.get(col, 0)))
+                except (ValueError, TypeError):
+                    ch_arrays[i].append(0.0)
+
+        if not ts_list:
+            return None
+        ts_us = np.array(ts_list, dtype=np.uint64)
+        time_sec = (ts_us.astype(np.float64) - float(ts_us[0])) / 1e6
+        data = np.array(ch_arrays, dtype=np.float32)  # (12, N)
+        return time_sec, data
+    except Exception:
+        return None
+
 
 # =============================================================================
 # CSV RECORDER  (thread-safe, called from receiver thread)
@@ -678,6 +737,52 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._cmd_sock = None
         self._cmd_lock = threading.Lock()
 
+        # --- Načtený CSV: zobrazení a procházení ---
+        self._csv_data = None   # (time_sec: np.ndarray, data: (12, N)) nebo None
+        self._csv_path = None
+        self._csv_window_start = 0.0   # začátek okna v sekundách (vztaženo na začátek souboru)
+        self._view_mode = "live"       # "live" | "csv"
+
+        # --- Tlačítko Načíst CSV ---
+        self.load_csv_btn = QtWidgets.QPushButton("📂 Načíst CSV")
+        self.load_csv_btn.setFixedWidth(120)
+        self.load_csv_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
+            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+        )
+        self.load_csv_btn.clicked.connect(self._on_load_csv)
+        controls_layout.addWidget(self.load_csv_btn)
+
+        # --- Režim zobrazení: Živý / CSV ---
+        self.view_mode_combo = QtWidgets.QComboBox()
+        self.view_mode_combo.setFixedWidth(140)
+        self.view_mode_combo.addItem("Živý signál", "live")
+        self.view_mode_combo.addItem("Načtený CSV", "csv")
+        self.view_mode_combo.setCurrentIndex(0)
+        self.view_mode_combo.setEnabled(False)
+        self.view_mode_combo.setStyleSheet(
+            "QComboBox { background: #333; color: #0af; font-size: 12px; "
+            "border: 1px solid #555; padding: 2px 6px; }"
+        )
+        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        controls_layout.addWidget(QtWidgets.QLabel("Režim:"))
+        controls_layout.addWidget(self.view_mode_combo)
+
+        # --- Slider procházení CSV (viditelný jen v režimu CSV) ---
+        self.csv_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.csv_slider.setMinimum(0)
+        self.csv_slider.setMaximum(0)
+        self.csv_slider.setValue(0)
+        self.csv_slider.setMinimumWidth(200)
+        self.csv_slider.valueChanged.connect(self._on_csv_slider_changed)
+        self.csv_slider.setVisible(False)
+        controls_layout.addWidget(self.csv_slider, stretch=0)
+
+        self.csv_pos_label = QtWidgets.QLabel("")
+        self.csv_pos_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.csv_pos_label.setVisible(False)
+        controls_layout.addWidget(self.csv_pos_label)
+
         # --- recording status update timer ---
         self._rec_timer = QtCore.QTimer()
         self._rec_timer.timeout.connect(self._update_rec_status)
@@ -870,35 +975,40 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     self.curves[i].setPen(pen)
 
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _estimate_hr(signal: np.ndarray, fs: float) -> float:
+    # Channels to try for HR auto-selection ((0)I, (1)II, (2)III, (5)aVF – limb leads)
+    HR_CANDIDATE_CHANNELS = (0, 1)
+
+    @classmethod
+    def _estimate_hr(cls, signal: np.ndarray, fs: float) -> float:
         """Estimate heart rate (BPM) from a 1-D ECG signal using simple
         threshold-based R-peak detection.  Returns 0.0 if not enough data."""
-        if signal.size < int(fs * 1.5):
-            return 0.0
+        bpm, _ = cls._estimate_hr_with_quality(signal, fs)
+        return bpm
 
-        # Band-pass-like preprocessing: remove DC, take abs of derivative
+    @classmethod
+    def _estimate_hr_with_quality(cls, signal: np.ndarray, fs: float) -> tuple:
+        """Estimate HR and quality (stability of RR intervals).
+        Returns (bpm, quality). quality is in [0, 1], higher = more stable RR.
+        Returns (0.0, 0.0) if not enough data or invalid."""
+        if signal.size < int(fs * 1.5):
+            return (0.0, 0.0)
+
         sig = signal.astype(np.float64)
         sig -= np.mean(sig)
         diff = np.diff(sig)
-        energy = diff * diff  # squared first-difference → accentuates QRS
+        energy = diff * diff
 
-        # Adaptive threshold: 40 % of the 95th-percentile energy
         thr = np.percentile(energy, 95) * 0.40
         if thr <= 0:
-            return 0.0
+            return (0.0, 0.0)
 
-        # Min distance between R-peaks: 300 ms (= 200 BPM max)
         min_dist = int(fs * 0.30)
-
-        # Find peaks above threshold with minimum distance
         above = energy > thr
         peaks = []
         i = 0
         n = len(above)
         while i < n:
             if above[i]:
-                # Find local maximum in this supra-threshold region
                 best = i
                 while i < n and above[i]:
                     if energy[i] > energy[best]:
@@ -910,16 +1020,40 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 i += 1
 
         if len(peaks) < 2:
-            return 0.0
+            return (0.0, 0.0)
 
-        # Average RR interval → BPM
         rr_samples = np.diff(peaks).astype(np.float64)
         rr_sec = np.mean(rr_samples) / fs
         bpm = 60.0 / rr_sec
-        # Sanity clamp
         if bpm < 20 or bpm > 250:
-            return 0.0
-        return bpm
+            return (0.0, 0.0)
+        # Quality: inverse of coefficient of variation of RR (stable = high quality)
+        rr_std = np.std(rr_samples)
+        rr_mean = np.mean(rr_samples)
+        if rr_mean <= 0:
+            return (bpm, 0.0)
+        cv = rr_std / rr_mean
+        quality = 1.0 / (1.0 + cv)
+        return (bpm, quality)
+
+    @classmethod
+    def _best_hr_from_channels(cls, data: np.ndarray, fs: float) -> tuple:
+        """Try limb leads (I, II, III, aVF) and return (bpm, channel_index) with best quality.
+        data shape: (num_channels, N). Returns (0.0, 0) if no valid HR."""
+        if data is None or data.ndim != 2 or data.shape[1] < int(fs * 1.5):
+            return (0.0, 0)
+        best_bpm = 0.0
+        best_quality = 0.0
+        best_ch = 0
+        for ch in cls.HR_CANDIDATE_CHANNELS:
+            if ch >= data.shape[0]:
+                continue
+            bpm, quality = cls._estimate_hr_with_quality(data[ch], fs)
+            if bpm > 0 and quality > best_quality:
+                best_quality = quality
+                best_bpm = bpm
+                best_ch = ch
+        return (best_bpm, best_ch)
 
     # ------------------------------------------------------------------ #
     def _on_pause_toggled(self):
@@ -932,10 +1066,87 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.timer.start(PLOT_INTERVAL_MS)
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
+    def _on_load_csv(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Načíst CSV", LOGS_DIR or SCRIPT_DIR,
+            "CSV soubory (*.csv);;Všechny soubory (*)"
+        )
+        if not path:
+            return
+        result = load_csv(path)
+        if result is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Chyba", "Soubor se nepodařilo načíst nebo nemá očekávaný formát\n(timestamp_us + 12 kanálů mV)."
+            )
+            return
+        time_sec, data = result
+        self._csv_data = (time_sec, data)
+        self._csv_path = path
+        self._csv_window_start = 0.0
+        self.setWindowTitle(f"ESP32 12-Lead ECG — {os.path.basename(path)}")
+        self.view_mode_combo.setEnabled(True)
+        self.view_mode_combo.setCurrentIndex(1)  # přepnout na "Načtený CSV"
+        self._view_mode = "csv"
+        total_sec = float(time_sec[-1]) if time_sec.size else 0.0
+        max_start = max(0, total_sec - WINDOW_SEC)
+        self.csv_slider.setMaximum(int(max_start * 10))  # krok 0.1 s
+        self.csv_slider.setValue(0)
+        self.csv_slider.setVisible(True)
+        self.csv_pos_label.setVisible(True)
+        self._update_csv_pos_label()
+
+    def _on_view_mode_changed(self, index):
+        mode = self.view_mode_combo.itemData(index)
+        self._view_mode = mode if mode else "live"
+        self.csv_slider.setVisible(self._view_mode == "csv" and self._csv_data is not None)
+        self.csv_pos_label.setVisible(self._view_mode == "csv" and self._csv_data is not None)
+        if self._view_mode == "csv":
+            self._update_csv_pos_label()
+            if self._csv_path:
+                self.setWindowTitle(f"ESP32 12-Lead ECG — {os.path.basename(self._csv_path)}")
+        else:
+            self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+
+    def _on_csv_slider_changed(self, value):
+        self._csv_window_start = value / 10.0
+        self._update_csv_pos_label()
+
+    def _update_csv_pos_label(self):
+        if self._csv_data is None:
+            self.csv_pos_label.setText("")
+            return
+        time_sec, data = self._csv_data
+        n = time_sec.size
+        total_sec = float(time_sec[-1]) if n else 0.0
+        self.csv_pos_label.setText(
+            f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + WINDOW_SEC, total_sec):.1f} s / {total_sec:.1f} s  ({n} vzorků)"
+        )
+
     def _update(self):
         """Called every PLOT_INTERVAL_MS – update curves & status."""
         if self._plot_paused:
             return
+
+        # Režim načteného CSV: zobrazit výřez podle slideru
+        if self._view_mode == "csv" and self._csv_data is not None:
+            time_sec, data = self._csv_data
+            t_end = self._csv_window_start + WINDOW_SEC
+            mask = (time_sec >= self._csv_window_start) & (time_sec <= t_end)
+            t = time_sec[mask].astype(np.float32)
+            if t.size == 0:
+                self._update_status(0, np.array([], dtype=np.uint64), None)
+                return
+            d = data[:, mask]
+            t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            for i in range(NUM_CHANNELS):
+                ch = np.asarray(d[i], dtype=np.float64)
+                ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                self.curves[i].setData(t, ch)
+            for p in self.plots:
+                p.setXRange(self._csv_window_start, min(t_end, float(time_sec[-1])), padding=0)
+            self._update_status(d.shape[1], np.array([], dtype=np.uint64), d if d.shape[1] > 0 else None)
+            return
+
         t, d, ts_us = self.ring.snapshot()
         if t.size == 0:
             self._x_view_min = self._x_view_max = None  # reset pro plynulý start po opětovném příjmu
@@ -979,10 +1190,31 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         for p in self.plots:
             p.setXRange(self._x_view_min, self._x_view_max, padding=0)
 
-        # Pass full-res Lead I (channel 0) for HR estimation
-        self._update_status(t.size, ts_us, d[0] if d.shape[1] > 0 else None)
+        # Pass full-res 12-channel data for HR auto-selection (best of I, II, III, aVF)
+        self._update_status(t.size, ts_us, d if d.shape[1] > 0 else None)
 
-    def _update_status(self, n_samples, ts_us, lead_i_data):
+    def _update_status(self, n_samples, ts_us, ecg_data):
+        """ecg_data: None, 1D array (single channel), or 2D (num_channels, N) for HR auto-selection."""
+        if self._view_mode == "csv" and self._csv_data is not None:
+            time_sec, data = self._csv_data
+            total_sec = float(time_sec[-1]) if time_sec.size else 0.0
+            hr_str = "HR: —"
+            if ecg_data is not None and np.size(ecg_data) > 0:
+                if ecg_data.ndim == 2 and ecg_data.shape[0] >= 6:
+                    bpm, ch = self._best_hr_from_channels(ecg_data, SAMPLE_RATE)
+                else:
+                    sig = ecg_data.ravel()
+                    bpm = self._estimate_hr(sig, SAMPLE_RATE)
+                    ch = 0
+                if bpm > 0:
+                    lead_name = ("I", "II", "III", "aVR", "aVL", "aVF")[ch] if ch < 6 else str(ch)
+                    hr_str = f"HR: {bpm:.0f} BPM ({lead_name})"
+            self.status_label.setText(
+                f"📂 CSV: {os.path.basename(self._csv_path or '')}   |   "
+                f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + WINDOW_SEC, total_sec):.1f} s / {total_sec:.1f} s   |   "
+                f"Vzorků: {n_samples:,}   |   {hr_str}"
+            )
+            return
         now = time.time()
         dt = now - self._last_stat_time
         pkts = self.receiver.packets_received
@@ -1003,13 +1235,19 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         latency_ms = self.receiver.last_latency_us / 1000.0
 
-        # Heart rate from Lead I (throttled to ~1 Hz – expensive)
+        # Heart rate with auto-selected best channel (I, II, III, aVF); throttled ~1 Hz
         if now - self._last_hr_time >= 1.0:
             self._last_hr_time = now
-            if lead_i_data is not None and lead_i_data.size > 0:
-                bpm = self._estimate_hr(lead_i_data, SAMPLE_RATE)
+            if ecg_data is not None and np.size(ecg_data) > 0:
+                if ecg_data.ndim == 2 and ecg_data.shape[0] >= 6:
+                    bpm, ch = self._best_hr_from_channels(ecg_data, SAMPLE_RATE)
+                else:
+                    sig = ecg_data.ravel()
+                    bpm = self._estimate_hr(sig, SAMPLE_RATE)
+                    ch = 0
                 if bpm > 0:
-                    self._last_hr_str = f"HR: {bpm:.0f} BPM"
+                    lead_name = ("I", "II", "III", "aVR", "aVL", "aVF")[ch] if ch < 6 else str(ch)
+                    self._last_hr_str = f"HR: {bpm:.0f} BPM ({lead_name})"
                 else:
                     self._last_hr_str = "HR: —"
         hr_str = self._last_hr_str
