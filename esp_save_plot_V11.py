@@ -1212,11 +1212,24 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._y_autoscale = False
 
     def _on_y_range_changed(self, vb, _range):
-        """Když uživatel změní rozsah Y (kolečko/drag) a filtry jsou zapnuté, vypnout fixní -1..1 mV."""
-        if not self.filter_cb.isChecked() or self._applying_autoscale:
+        """Při zapnutém filtru: vynutit Y vždy symetricky kolem 0 (zoom jen okolo Y=0).
+        Při vypnutém filtru: při manuální změně jen vypnout fixní -1..1 mV."""
+        if self._applying_autoscale:
             return
         yr = vb.viewRange()[1]
         ymin, ymax = yr[0], yr[1]
+        if self.filter_cb.isChecked():
+            # Při zapnutém filtru: scaling pouze okolo Y=0 – vynutit symetrický rozsah [-span, +span]
+            span = max(abs(ymin), abs(ymax), 0.02)  # min span 0.02 mV, aby zoom nebyl nekonečný
+            span = min(span, 50.0)  # max 50 mV
+            self._y_autoscale = False
+            self._applying_autoscale = True
+            try:
+                vb.setYRange(-span, span, padding=0)
+            finally:
+                self._applying_autoscale = False
+            return
+        # Při vypnutém filtru: jen poznámka, že uživatel odchýlil od fixního rozsahu
         tol = 0.05
         if abs(ymin - Y_VIEW_MIN_MV) > tol or abs(ymax - Y_VIEW_MAX_MV) > tol:
             self._y_autoscale = False
