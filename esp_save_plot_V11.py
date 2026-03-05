@@ -88,9 +88,8 @@ FRAME_HEADER    = 3           # 2B sync + 1B count
 SAMPLES_PER_FRAME = 10
 FRAME_EXPECTED  = FRAME_HEADER + SAMPLES_PER_FRAME * SAMPLE_SIZE  # 623
 
-# ---- ADS1298 → Voltage conversion ----
-# V_input = ADC_code × VREF / (Gain × 2^23)
-# With VREF=2.4 V, Gain=6:  1 LSB = 4.76837158e-8 V = 0.0476837158 µV
+# ---- ADS1298 → Voltage conversion (vše v mV) ----
+# V_input = ADC_code × VREF / (Gain × 2^23); výstup převádíme na mV (× 1e3)
 ADS_VREF        = 2.4              # Internal reference voltage [V]
 ADS_GAIN        = 6                # PGA gain (CHnSET[6:4] = 000)
 ADS_LSB_MV      = (ADS_VREF / (ADS_GAIN * (2**23))) * 1e3   # mV per LSB
@@ -109,8 +108,8 @@ NOTCH_QUALITY         = 30    # Q pro úzký zářez
 FILTER_MIN_SAMPLES    = int(SAMPLE_RATE * 1.0)  # alespoň 1 s
 
 def compute_lsb_mv(gain: int) -> float:
-    """Compute mV-per-LSB for a given PGA gain."""
-    return (ADS_VREF / (gain * (2**23))) * 1e6 / 1000.0
+    """Vrátí mV na LSB pro dané PGA gain (vstup i výstup zůstávají v mV)."""
+    return (ADS_VREF / (gain * (2**23))) * 1e3
 
 
 # =============================================================================
@@ -679,9 +678,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             if i > 0:
                 self.pw.nextRow()
             p = self.pw.addPlot()
-            p.setLabel("left", CHANNEL_LABELS[i], units="mV")
-            # Stejná šířka prostoru pro popisky Y u všech grafů → osy vizuálně srovnané
-            p.getAxis("left").setStyle(tickTextWidth=52, autoExpandTextSpace=False)
+            # Jednotky "mV" v textu popisku – bez units= v API, aby PyQtGraph neaplikoval SI předpony (mmV) a neškáloval hodnoty
+            p.setLabel("left", f"{CHANNEL_LABELS[i]}, mV", units="")
+            left_axis = p.getAxis("left")
+            left_axis.setStyle(tickTextWidth=52, autoExpandTextSpace=False)
+            # Zakázat automatické SI předpony na ose Y – hodnoty zůstávají v mV (0.2, 0.5, 1.0), ne ve stovkách
+            if hasattr(left_axis, "enableAutoSIPrefix"):
+                left_axis.enableAutoSIPrefix(False)
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMouseEnabled(x=False, y=True)
             p.enableAutoRange(axis="y", enable=True)
