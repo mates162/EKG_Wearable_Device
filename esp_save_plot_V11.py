@@ -26,7 +26,7 @@ Usage:
     3. The plotter auto-connects and starts streaming
 
 Dependencies:
-    pip install pyqtgraph PyQt5 numpy
+    pip install pyqtgraph PyQt5 numpy scipy
 """
 
 import csv
@@ -41,6 +41,12 @@ from datetime import datetime
 import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+try:
+    from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
 
 # =============================================================================
 # CONFIGURATION
@@ -92,9 +98,72 @@ ADS_LSB_MV      = (ADS_VREF / (ADS_GAIN * (2**23))) * 1e3   # mV per LSB
 # Valid ADS1298 PGA gain values
 VALID_GAINS     = [1, 2, 3, 4, 6, 8, 12]
 
+# ---- Klinické EKG filtry (AAMI / diagnostické EKG) ----
+# Pásmový filtr: odstraní baseline wander (<0.5 Hz) a vysokofrekvenční šum (>40 Hz)
+FILTER_BANDPASS_LOW   = 0.5   # Hz
+FILTER_BANDPASS_HIGH  = 40.0  # Hz
+FILTER_BANDPASS_ORDER = 4     # řád Butterworth
+# Notch: potlačení síťového rušení (50 Hz EU / 60 Hz US)
+NOTCH_QUALITY         = 30    # Q pro úzký zářez
+# Minimální počet vzorků pro stabilní filtrování (filtfilt)
+FILTER_MIN_SAMPLES    = int(SAMPLE_RATE * 1.0)  # alespoň 1 s
+
 def compute_lsb_mv(gain: int) -> float:
     """Compute mV-per-LSB for a given PGA gain."""
     return (ADS_VREF / (gain * (2**23))) * 1e6 / 1000.0
+
+
+# =============================================================================
+# KLINICKÉ EKG FILTRY
+# =============================================================================
+
+def apply_ecg_filters(
+    data: np.ndarray,
+    fs: float,
+    bandpass_low: float = FILTER_BANDPASS_LOW,
+    bandpass_high: float = FILTER_BANDPASS_HIGH,
+    notch_hz: float | None = 50.0,
+) -> np.ndarray:
+    """Aplikuje filtry používané při záznamu klinického EKG:
+    - Pásmový filtr 0,5–40 Hz (Butterworth): baseline wander + HF šum
+    - Notch 50/60 Hz: síťové rušení
+
+    data: shape (num_channels, N) v mV
+    fs: vzorkovací kmitočet [Hz]
+    notch_hz: None = bez notch, jinak 50 nebo 60
+    Vrací filtrovaná data stejného tvaru. Při nedostupném scipy vrací data beze změny.
+    """
+    if not _SCIPY_AVAILABLE:
+        return data
+    if data.size == 0:
+        return data
+    num_ch, n = data.shape
+    if n < FILTER_MIN_SAMPLES:
+        return data
+
+    out = np.empty_like(data, dtype=np.float64)
+    for ch in range(num_ch):
+        sig = np.asarray(data[ch], dtype=np.float64)
+
+        # 1) Bandpass 0.5–40 Hz (AAMI EC11)
+        nyq = 0.5 * fs
+        low = max(0.01, bandpass_low / nyq)
+        high = min(0.99, bandpass_high / nyq)
+        if low < high:
+            sos = butter(FILTER_BANDPASS_ORDER, [low, high], btype="band", output="sos")
+            sig = sosfiltfilt(sos, sig, axis=-1)
+
+        # 2) Notch 50/60 Hz
+        if notch_hz is not None and 0 < notch_hz < nyq:
+            w0 = notch_hz / nyq
+            if w0 < 0.99 and w0 > 0.01:
+                b, a = iirnotch(notch_hz, NOTCH_QUALITY, fs)
+                sig = filtfilt(b, a, sig, axis=-1)
+
+        out[ch] = sig
+
+    return out.astype(data.dtype, copy=False)
+
 
 # 12-lead display order:  I, II, III, aVR, aVL, aVF, V1–V6
 # Index mapping from raw ADS1298 data (0–7) to display channels (0–11):
@@ -709,6 +778,35 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.pause_btn.clicked.connect(self._on_pause_toggled)
         controls_layout.addWidget(self.pause_btn)
 
+        # --- Klinické filtry EKG (0,5–40 Hz + notch) ---
+        controls_layout.addSpacing(24)
+        self.filter_cb = QtWidgets.QCheckBox("Klinické filtry: ZAPNUTO")
+        self.filter_cb.setChecked(True)
+        self.filter_cb.setStyleSheet(
+            "QCheckBox { font-size: 13px; font-weight: bold; }"
+            "QCheckBox { color: #0c5; }"
+            "QCheckBox:unchecked { color: #666; }"
+            "QCheckBox::indicator { width: 20px; height: 20px; border: 2px solid #555; border-radius: 3px; background: #2a2a2a; }"
+            "QCheckBox:checked::indicator { background: #0a5; border-color: #0f8; }"
+            "QCheckBox:unchecked::indicator { background: #333; }"
+        )
+        self.filter_cb.setToolTip(
+            "Pásmový filtr 0,5–40 Hz (baseline + HF šum) a notch 50/60 Hz (síť). Doporučeno pro diagnostické EKG."
+        )
+        self.filter_cb.stateChanged.connect(self._on_filter_toggled)
+        controls_layout.addWidget(self.filter_cb)
+        self.notch_combo = QtWidgets.QComboBox()
+        self.notch_combo.setFixedWidth(70)
+        self.notch_combo.addItem("50 Hz", 50.0)
+        self.notch_combo.addItem("60 Hz", 60.0)
+        self.notch_combo.setCurrentIndex(0)
+        self.notch_combo.setStyleSheet(
+            "QComboBox { background: #333; color: #0af; font-size: 12px; border: 1px solid #555; padding: 2px 4px; }"
+        )
+        self.notch_combo.setToolTip("Frekvence notch filtru (síťové rušení)")
+        controls_layout.addWidget(QtWidgets.QLabel("Notch:"))
+        controls_layout.addWidget(self.notch_combo)
+
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
@@ -1066,6 +1164,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.timer.start(PLOT_INTERVAL_MS)
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
+    def _on_filter_toggled(self, _state):
+        """Aktualizovat text checkboxu podle stavu filtrů (zapnuto/vypnuto)."""
+        if self.filter_cb.isChecked():
+            self.filter_cb.setText("Klinické filtry: ZAPNUTO")
+        else:
+            self.filter_cb.setText("Klinické filtry: VYPNUTO")
+
     def _on_load_csv(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Načíst CSV", LOGS_DIR or SCRIPT_DIR,
@@ -1136,7 +1241,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             if t.size == 0:
                 self._update_status(0, np.array([], dtype=np.uint64), None)
                 return
-            d = data[:, mask]
+            d = data[:, mask].astype(np.float64)
+            # Klinické filtry EKG při zobrazení CSV
+            if self.filter_cb.isChecked():
+                notch_hz = self.notch_combo.currentData()
+                d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
             t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
             for i in range(NUM_CHANNELS):
                 ch = np.asarray(d[i], dtype=np.float64)
@@ -1152,6 +1261,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._x_view_min = self._x_view_max = None  # reset pro plynulý start po opětovném příjmu
             self._update_status(0, np.array([], dtype=np.uint64), None)
             return
+
+        # Klinické filtry EKG (0,5–40 Hz + notch)
+        if self.filter_cb.isChecked():
+            notch_hz = self.notch_combo.currentData()
+            d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
 
         # Sanitize: nahradit nan/inf konečnými hodnotami, aby PyQtGraph ViewBox nezpůsobil "overflow in cast"
         t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
