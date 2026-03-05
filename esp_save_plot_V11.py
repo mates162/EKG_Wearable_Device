@@ -69,13 +69,12 @@ PLOT_INTERVAL_MS = 12
 # Plynulý posun osy X: 0 = žádné, 1 = okamžitý skok; 0.2–0.35 = plynulé sledování
 SCROLL_SMOOTH_ALPHA = 0.28
 
-# # --- Y_SPAN: zakomentováno kvůli manuálnímu škálování kolečkem myši ---
-# # Minimální rozsah osy Y (mV) pro jeden svod; skutečný rozsah = max(rozsah dat, Y_SPAN_MIN_MV)
-# # → každý kanál se přizpůsobí amplitudě svého signálu, data neklipují
-# Y_SPAN_MIN_MV = 0.5
-# # Volitelně: pevný rozsah pro každý svod (mV), None = auto z dat
-# # Příklad: [2.0, 2.0, 1.5, 1.5, 1.5, 1.5, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0] pro I, II, III, aVR, aVL, aVF, V1–V6
-# Y_SPAN_PER_CHANNEL_MV = None  # nebo seznam 12 čísel
+# --- Y osa: fixní rozptyl -1..1 mV jen při zapnutých filtrech; při vypnutých filtrech autoscale ---
+Y_SPAN_MV = 2.0   # rozptyl v mV (rozsah -1 .. 1 mV)
+Y_VIEW_MIN_MV = -1.0
+Y_VIEW_MAX_MV = 1.0
+# Jak často obnovit fixní rozsah Y (s), aby to neškubalo a nezpomalovalo
+Y_FIXED_RANGE_INTERVAL_S = 0.4
 
 # TCP receive buffer size
 TCP_RECV_SIZE   = 16384
@@ -687,7 +686,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 left_axis.enableAutoSIPrefix(False)
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMouseEnabled(x=False, y=True)
-            p.enableAutoRange(axis="y", enable=True)
+            p.enableAutoRange(axis="y", enable=False)
+            p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
             p.setClipToView(True)
             p.setDownsampling(mode='peak')
             # Compact vertical height
@@ -707,6 +707,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             curve = p.plot(pen=pen)
             self.plots.append(p)
             self.curves.append(curve)
+
+        # --- Y: při zapnutých filtrech fixní -1..1 mV (kolečko pustí, Autoscale vrátí); při vypnutých filtrech autoscale ---
+        self._y_autoscale = True
+        self._applying_autoscale = False
+        self._last_y_fixed_range_time = 0.0
+        for p in self.plots:
+            p.getViewBox().sigRangeChanged.connect(self._on_y_range_changed)
 
         # --- double-click to maximize/restore ---
         self._maximized_index = None   # None = all visible, int = maximized channel
@@ -809,6 +816,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.notch_combo.setToolTip("Frekvence notch filtru (síťové rušení)")
         controls_layout.addWidget(QtWidgets.QLabel("Notch:"))
         controls_layout.addWidget(self.notch_combo)
+
+        # --- Autoscale Y: návrat na rozptyl -1 .. 1 mV ---
+        controls_layout.addSpacing(24)
+        self.autoscale_btn = QtWidgets.QPushButton("Autoscale Y")
+        self.autoscale_btn.setFixedWidth(110)
+        self.autoscale_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #0af; font-size: 13px; "
+            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+        )
+        self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
+        self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
+        controls_layout.addWidget(self.autoscale_btn)
 
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
@@ -1168,11 +1187,49 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
     def _on_filter_toggled(self, _state):
-        """Aktualizovat text checkboxu podle stavu filtrů (zapnuto/vypnuto)."""
-        if self.filter_cb.isChecked():
+        """Při zapnutí filtrů: fixní Y -1..1 mV; při vypnutí: Y autoscale. Aktualizovat text checkboxu."""
+        filters_on = self.filter_cb.isChecked()
+        if filters_on:
             self.filter_cb.setText("Klinické filtry: ZAPNUTO")
+            self.autoscale_btn.setEnabled(True)
+            self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
+            for p in self.plots:
+                p.enableAutoRange(axis="y", enable=False)
+            self._y_autoscale = True
+            self._applying_autoscale = True
+            try:
+                for p in self.plots:
+                    p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
+            finally:
+                self._applying_autoscale = False
+            self._last_y_fixed_range_time = time.time()
         else:
             self.filter_cb.setText("Klinické filtry: VYPNUTO")
+            self.autoscale_btn.setEnabled(False)
+            self.autoscale_btn.setToolTip("Dostupné jen při zapnutých klinických filtrech (Y má pak autoscale)")
+            for p in self.plots:
+                p.enableAutoRange(axis="y", enable=True)
+            self._y_autoscale = False
+
+    def _on_y_range_changed(self, vb, _range):
+        """Když uživatel změní rozsah Y (kolečko/drag) a filtry jsou zapnuté, vypnout fixní -1..1 mV."""
+        if not self.filter_cb.isChecked() or self._applying_autoscale:
+            return
+        yr = vb.viewRange()[1]
+        ymin, ymax = yr[0], yr[1]
+        tol = 0.05
+        if abs(ymin - Y_VIEW_MIN_MV) > tol or abs(ymax - Y_VIEW_MAX_MV) > tol:
+            self._y_autoscale = False
+
+    def _on_autoscale_clicked(self):
+        """Nastavit všechny kanály na rozptyl -1 .. 1 mV."""
+        self._y_autoscale = True
+        self._applying_autoscale = True
+        try:
+            for p in self.plots:
+                p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
+        finally:
+            self._applying_autoscale = False
 
     def _on_load_csv(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1254,6 +1311,16 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 ch = np.asarray(d[i], dtype=np.float64)
                 ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
                 self.curves[i].setData(t, ch)
+            if self.filter_cb.isChecked() and self._y_autoscale:
+                now = time.time()
+                if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
+                    self._last_y_fixed_range_time = now
+                    self._applying_autoscale = True
+                    try:
+                        for p in self.plots:
+                            p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
+                    finally:
+                        self._applying_autoscale = False
             for p in self.plots:
                 p.setXRange(self._csv_window_start, min(t_end, float(time_sec[-1])), padding=0)
             self._update_status(d.shape[1], np.array([], dtype=np.uint64), d if d.shape[1] > 0 else None)
@@ -1276,19 +1343,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             ch = np.asarray(d[i], dtype=np.float64)
             ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
             self.curves[i].setData(t, ch)
-            # # --- Y_SPAN: zakomentováno – aby fungovalo manuální škálování kolečkem myši ---
-            # # Rozsah Y: buď z Y_SPAN_PER_CHANNEL_MV[i], nebo auto z dat (min. Y_SPAN_MIN_MV)
-            # if ch.size > 0:
-            #     lo, hi = float(np.min(ch)), float(np.max(ch))
-            #     center = (lo + hi) * 0.5
-            #     data_span = hi - lo
-            #     if Y_SPAN_PER_CHANNEL_MV is not None and len(Y_SPAN_PER_CHANNEL_MV) > i:
-            #         span = float(Y_SPAN_PER_CHANNEL_MV[i])
-            #     else:
-            #         span = max(data_span, Y_SPAN_MIN_MV)
-            #     half = span * 0.5
-            #     pad = span * 0.05
-            #     self.plots[i].setYRange(center - half - pad, center + half + pad, padding=0)
+
+        # Y: při zapnutých filtrech a fixním režimu držet -1..1 mV, obnovovat jen občas (ne každý snímek)
+        if self.filter_cb.isChecked() and self._y_autoscale:
+            now = time.time()
+            if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
+                self._last_y_fixed_range_time = now
+                self._applying_autoscale = True
+                try:
+                    for p in self.plots:
+                        p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
+                finally:
+                    self._applying_autoscale = False
 
         # Plynulý scroll osy X: plynulé přibližování k cílovému rozsahu
         t_newest = float(t[-1])
