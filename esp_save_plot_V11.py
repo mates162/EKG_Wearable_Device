@@ -75,6 +75,8 @@ Y_VIEW_MIN_MV = -1.0
 Y_VIEW_MAX_MV = 1.0
 # Jak často obnovit fixní rozsah Y (s), aby to neškubalo a nezpomalovalo
 Y_FIXED_RANGE_INTERVAL_S = 0.4
+# Jak často přepočítat klinické filtry (s) – menší = plynulejší, větší = úspora CPU
+FILTER_UPDATE_INTERVAL_S = 0.05
 
 # TCP receive buffer size
 TCP_RECV_SIZE   = 16384
@@ -141,30 +143,31 @@ def apply_ecg_filters(
     if n < FILTER_MIN_SAMPLES:
         return data
 
-    # Délka paddingu na okrajích: sníží deformaci na začátku/konci (filtfilt rozšíří signál)
+    nyq = 0.5 * fs
     padlen = min(FILTER_EDGE_PAD_SAMPLES, (n - 1) // 2)
     if padlen < 1:
-        padlen = None  # scipy použije výchozí
+        padlen = None
+
+    # Koeficienty spočítat jednou (stejné pro všechny kanály) – výrazná úspora CPU
+    sos_bp = None
+    low = max(0.01, bandpass_low / nyq)
+    high = min(0.99, bandpass_high / nyq)
+    if low < high:
+        sos_bp = butter(FILTER_BANDPASS_ORDER, [low, high], btype="band", output="sos")
+    notch_ba = None
+    if notch_hz is not None and 0 < notch_hz < nyq:
+        w0 = notch_hz / nyq
+        if 0.01 < w0 < 0.99:
+            notch_ba = iirnotch(notch_hz, NOTCH_QUALITY, fs)
 
     out = np.empty_like(data, dtype=np.float64)
     for ch in range(num_ch):
         sig = np.asarray(data[ch], dtype=np.float64)
-
-        # 1) Bandpass 0.5–40 Hz (AAMI EC11)
-        nyq = 0.5 * fs
-        low = max(0.01, bandpass_low / nyq)
-        high = min(0.99, bandpass_high / nyq)
-        if low < high:
-            sos = butter(FILTER_BANDPASS_ORDER, [low, high], btype="band", output="sos")
-            sig = sosfiltfilt(sos, sig, axis=-1, padtype="odd", padlen=padlen)
-
-        # 2) Notch 50/60 Hz
-        if notch_hz is not None and 0 < notch_hz < nyq:
-            w0 = notch_hz / nyq
-            if w0 < 0.99 and w0 > 0.01:
-                b, a = iirnotch(notch_hz, NOTCH_QUALITY, fs)
-                sig = filtfilt(b, a, sig, axis=-1, padtype="odd", padlen=padlen)
-
+        if sos_bp is not None:
+            sig = sosfiltfilt(sos_bp, sig, axis=-1, padtype="odd", padlen=padlen)
+        if notch_ba is not None:
+            b, a = notch_ba
+            sig = filtfilt(b, a, sig, axis=-1, padtype="odd", padlen=padlen)
         out[ch] = sig
 
     return out.astype(data.dtype, copy=False)
@@ -243,18 +246,19 @@ def load_csv(filepath: str):
         if len(ch_cols) != NUM_CHANNELS:
             return None
 
+        # Přímý přístup podle názvu sloupce (rychlejší než row.get(key, default) v cyklu)
         ts_list = []
         ch_arrays = [[] for _ in range(NUM_CHANNELS)]
         for row in rows:
             try:
-                t = int(float(row.get(ts_key, 0)))
-            except (ValueError, TypeError):
+                t = int(float(row[ts_key]))
+            except (ValueError, TypeError, KeyError):
                 continue
             ts_list.append(t)
             for i, col in enumerate(ch_cols):
                 try:
-                    ch_arrays[i].append(float(row.get(col, 0)))
-                except (ValueError, TypeError):
+                    ch_arrays[i].append(float(row[col]))
+                except (ValueError, TypeError, KeyError):
                     ch_arrays[i].append(0.0)
 
         if not ts_list:
@@ -346,11 +350,13 @@ class CsvRecorder:
         with self._lock:
             if not self._recording or self._writer is None:
                 return
-            for ts, ch in zip(timestamps, channels):
-                row = [ts] + [f"{v:.6f}" for v in ch] + [gain]
-                self._writer.writerow(row)
+            # Dávkový zápis writerows místo writerow po řádku – méně I/O a formátování
+            rows = [
+                [ts] + [f"{v:.6f}" for v in ch] + [gain]
+                for ts, ch in zip(timestamps, channels)
+            ]
+            self._writer.writerows(rows)
             self._sample_count += len(timestamps)
-            # Flush every ~500 samples (≈1 s) to keep file up-to-date
             if self._sample_count % 500 < len(timestamps):
                 try:
                     self._file.flush()
@@ -719,6 +725,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._y_autoscale = True
         self._applying_autoscale = False
         self._last_y_fixed_range_time = 0.0
+        # Cache filtrovaných dat: přepočet jen každých FILTER_UPDATE_INTERVAL_S
+        self._last_filter_time = 0.0
+        self._filtered_t = None
+        self._filtered_d = None
+        self._filtered_csv_window_start = None  # v CSV režimu invalidace při posunu slideru
         for p in self.plots:
             p.getViewBox().sigRangeChanged.connect(self._on_y_range_changed)
 
@@ -1322,14 +1333,37 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 self._update_status(0, np.array([], dtype=np.uint64), None)
                 return
             d = data[:, mask].astype(np.float64)
-            # Klinické filtry EKG při zobrazení CSV
+            # Klinické filtry EKG při zobrazení CSV (throttling + invalidace při posunu slideru)
             if self.filter_cb.isChecked():
-                notch_hz = self.notch_combo.currentData()
-                d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
-            t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                now = time.time()
+                cache_valid = (
+                    self._filtered_t is not None
+                    and self._filtered_csv_window_start == self._csv_window_start
+                    and (now - self._last_filter_time < FILTER_UPDATE_INTERVAL_S)
+                )
+                if not cache_valid:
+                    notch_hz = self.notch_combo.currentData()
+                    d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
+                    self._filtered_t = t.copy()
+                    self._filtered_d = d.copy()
+                    self._filtered_csv_window_start = self._csv_window_start
+                    self._last_filter_time = now
+                if self._filtered_t is not None and self._filtered_d is not None:
+                    t, d = self._filtered_t, self._filtered_d
+            else:
+                self._filtered_t = None
+                self._filtered_d = None
+                self._filtered_csv_window_start = None
+            if not np.all(np.isfinite(t)):
+                t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            else:
+                t = t.astype(np.float32) if t.dtype != np.float32 else t
             for i in range(NUM_CHANNELS):
                 ch = np.asarray(d[i], dtype=np.float64)
-                ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                if not np.all(np.isfinite(ch)):
+                    ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                else:
+                    ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch.astype(np.float32)
                 self.curves[i].setData(t, ch)
             if self.filter_cb.isChecked() and self._y_autoscale:
                 now = time.time()
@@ -1352,16 +1386,32 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._update_status(0, np.array([], dtype=np.uint64), None)
             return
 
-        # Klinické filtry EKG (0,5–40 Hz + notch)
+        # Klinické filtry EKG: přepočet jen každých FILTER_UPDATE_INTERVAL_S (úspora CPU)
         if self.filter_cb.isChecked():
-            notch_hz = self.notch_combo.currentData()
-            d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
+            now = time.time()
+            if (self._filtered_t is None) or (now - self._last_filter_time >= FILTER_UPDATE_INTERVAL_S):
+                notch_hz = self.notch_combo.currentData()
+                d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
+                self._filtered_t = t.copy()
+                self._filtered_d = d.copy()
+                self._last_filter_time = now
+            if self._filtered_t is not None:
+                t, d = self._filtered_t, self._filtered_d
+        else:
+            self._filtered_t = None
+            self._filtered_d = None
 
-        # Sanitize: nahradit nan/inf konečnými hodnotami, aby PyQtGraph ViewBox nezpůsobil "overflow in cast"
-        t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        # Sanitize jen při nan/inf (data z ESP je obvykle konečná – úspora alokací)
+        if not np.all(np.isfinite(t)):
+            t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        else:
+            t = t.astype(np.float32) if t.dtype != np.float32 else t
         for i in range(NUM_CHANNELS):
             ch = np.asarray(d[i], dtype=np.float64)
-            ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            if not np.all(np.isfinite(ch)):
+                ch = np.nan_to_num(ch, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            else:
+                ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch
             self.curves[i].setData(t, ch)
 
         # Y: při zapnutých filtrech a fixním režimu držet -1..1 mV, obnovovat jen občas (ne každý snímek)
@@ -1401,17 +1451,23 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         if self._view_mode == "csv" and self._csv_data is not None:
             time_sec, data = self._csv_data
             total_sec = float(time_sec[-1]) if time_sec.size else 0.0
-            hr_str = "HR: —"
-            if ecg_data is not None and np.size(ecg_data) > 0:
-                if ecg_data.ndim == 2 and ecg_data.shape[0] >= 6:
-                    bpm, ch = self._best_hr_from_channels(ecg_data, SAMPLE_RATE)
-                else:
-                    sig = ecg_data.ravel()
-                    bpm = self._estimate_hr(sig, SAMPLE_RATE)
-                    ch = 0
-                if bpm > 0:
-                    lead_name = ("I", "II", "III", "aVR", "aVL", "aVF")[ch] if ch < 6 else str(ch)
-                    hr_str = f"HR: {bpm:.0f} BPM ({lead_name})"
+            # HR v CSV režimu throttlovat na ~1 Hz (stejně jako živý režim) – úspora CPU
+            now = time.time()
+            if now - self._last_hr_time >= 1.0:
+                self._last_hr_time = now
+                hr_str = "HR: —"
+                if ecg_data is not None and np.size(ecg_data) > 0:
+                    if ecg_data.ndim == 2 and ecg_data.shape[0] >= 6:
+                        bpm, ch = self._best_hr_from_channels(ecg_data, SAMPLE_RATE)
+                    else:
+                        sig = ecg_data.ravel()
+                        bpm = self._estimate_hr(sig, SAMPLE_RATE)
+                        ch = 0
+                    if bpm > 0:
+                        lead_name = ("I", "II", "III", "aVR", "aVL", "aVF")[ch] if ch < 6 else str(ch)
+                        hr_str = f"HR: {bpm:.0f} BPM ({lead_name})"
+                    self._last_hr_str = hr_str
+            hr_str = getattr(self, "_last_hr_str", "HR: —")
             self.status_label.setText(
                 f"📂 CSV: {os.path.basename(self._csv_path or '')}   |   "
                 f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + WINDOW_SEC, total_sec):.1f} s / {total_sec:.1f} s   |   "
