@@ -679,14 +679,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         # --- Horní záložky: živý signál / přehrávání CSV ---
         self.mode_tabs = QtWidgets.QTabWidget()
-        self.mode_tabs.setDocumentMode(True)
+        # documentMode + záporné okraje na Windows často ořezávají text záložek
+        tab_bar = self.mode_tabs.tabBar()
+        tab_bar.setElideMode(QtCore.Qt.ElideNone)
+        tab_bar.setUsesScrollButtons(False)
         self.mode_tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #444; background: #252525; margin-top: -1px; }\n"
-            "QTabBar::tab { background: #383838; color: #aaa; padding: 10px 28px; "
-            "font-weight: bold; font-size: 13px; border: 1px solid #555; border-bottom: none; "
-            "border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }\n"
-            "QTabBar::tab:selected { background: #1e1e1e; color: #0d0; }\n"
-            "QTabBar::tab:!selected { margin-top: 2px; }"
+            "QTabWidget::pane { border: 1px solid #444; background: #252525; }\n"
+            "QTabBar::tab { background: #383838; color: #aaa; "
+            "min-height: 28px; min-width: 8em; padding: 8px 20px; "
+            "font-weight: bold; font-size: 13px; border: 1px solid #555; "
+            "border-bottom-color: #444; border-top-left-radius: 4px; border-top-right-radius: 4px; "
+            "margin-right: 2px; }\n"
+            "QTabBar::tab:selected { background: #1e1e1e; color: #0d0; border-bottom-color: #1e1e1e; }"
         )
         live_tab = QtWidgets.QWidget()
         live_layout = QtWidgets.QHBoxLayout(live_tab)
@@ -799,6 +803,34 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "color: #888; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
         live_layout.addWidget(self.rec_status_label)
+
+        live_layout.addSpacing(16)
+        dur_lbl = QtWidgets.QLabel("Délka (s):")
+        dur_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+        live_layout.addWidget(dur_lbl)
+        self.rec_duration_edit = QtWidgets.QLineEdit()
+        self.rec_duration_edit.setFixedWidth(64)
+        self.rec_duration_edit.setPlaceholderText("60")
+        self.rec_duration_edit.setToolTip("Délka časované nahrávky v sekundách (desetinná čárka i tečka).")
+        self.rec_duration_edit.setStyleSheet(
+            "QLineEdit { background: #333; color: #eee; border: 1px solid #555; "
+            "padding: 2px 6px; font-size: 13px; }"
+        )
+        _dur_val = QtGui.QDoubleValidator(0.1, 86400.0, 2, self)
+        _dur_val.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        _dur_val.setLocale(QtCore.QLocale.system())
+        self.rec_duration_edit.setValidator(_dur_val)
+        live_layout.addWidget(self.rec_duration_edit)
+
+        self.rec_timed_btn = QtWidgets.QPushButton("⏱ REC na čas")
+        self.rec_timed_btn.setFixedWidth(130)
+        self.rec_timed_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
+            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+        )
+        self.rec_timed_btn.setToolTip("Spustí nahrávání a po zadaném počtu sekund ji ukončí.")
+        self.rec_timed_btn.clicked.connect(self._on_rec_timed_clicked)
+        live_layout.addWidget(self.rec_timed_btn)
 
         live_layout.addSpacing(24)
 
@@ -926,6 +958,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._rec_timer.timeout.connect(self._update_rec_status)
         self._rec_timer.start(500)
 
+        self._rec_timed_deadline = None  # time.monotonic() konec časované nahrávky, jinak None
+        self._rec_timed_timer = QtCore.QTimer(self)
+        self._rec_timed_timer.setSingleShot(True)
+        self._rec_timed_timer.timeout.connect(self._finish_timed_recording)
+
     # ------------------------------------------------------------------ #
     def _connect_cmd(self):
         """Ensure command TCP socket is connected."""
@@ -1028,9 +1065,78 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             )
 
     # ------------------------------------------------------------------ #
+    def _parse_rec_duration_sec(self) -> float | None:
+        """Vrací délku nahrávky v sekundách nebo None při neplatném vstupu."""
+        s = self.rec_duration_edit.text().strip().replace(",", ".")
+        if not s:
+            ph = (self.rec_duration_edit.placeholderText() or "").strip().replace(",", ".")
+            s = ph if ph else "60"
+        try:
+            v = float(s)
+        except ValueError:
+            return None
+        if not np.isfinite(v) or v < 0.1 or v > 86400.0:
+            return None
+        return v
+
+    def _on_rec_timed_clicked(self):
+        """Spustí nahrávání na pevně daný čas (sekundy z pole)."""
+        if self.recorder.recording:
+            QtWidgets.QMessageBox.information(
+                self, "Nahrávání",
+                "Už probíhá nahrávání. Nejprve ho ukončete tlačítkem STOP."
+            )
+            return
+        sec = self._parse_rec_duration_sec()
+        if sec is None:
+            QtWidgets.QMessageBox.warning(
+                self, "Neplatná délka",
+                "Zadejte kladné číslo sekund (0,1 až 86400), např. 30 nebo 60.5."
+            )
+            return
+        self.recorder.start()
+        self._rec_timed_deadline = time.monotonic() + sec
+        self._rec_timed_timer.start(int(round(sec * 1000.0)))
+        self.rec_timed_btn.setEnabled(False)
+        self.rec_duration_edit.setEnabled(False)
+        self.rec_btn.blockSignals(True)
+        self.rec_btn.setChecked(True)
+        self.rec_btn.setText("⏹  STOP")
+        self.rec_btn.blockSignals(False)
+        fname = os.path.basename(self.recorder.filename)
+        self.rec_status_label.setText(
+            f"Časovaná nahrávka {sec:.1f} s → {fname}"
+        )
+        self.rec_status_label.setStyleSheet(
+            "color: #f44; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+        )
+
+    def _finish_timed_recording(self):
+        """Ukončení nahrávání po vypršení časovače."""
+        self._rec_timed_deadline = None
+        if not self.recorder.recording:
+            self.rec_timed_btn.setEnabled(True)
+            self.rec_duration_edit.setEnabled(True)
+            return
+        n = self.recorder.sample_count
+        fname = os.path.basename(self.recorder.filename)
+        self.recorder.stop()
+        self.rec_btn.blockSignals(True)
+        self.rec_btn.setChecked(False)
+        self.rec_btn.setText("⏺  REC")
+        self.rec_btn.blockSignals(False)
+        self.rec_timed_btn.setEnabled(True)
+        self.rec_duration_edit.setEnabled(True)
+        self.rec_status_label.setText(f"Uloženo {n:,} vzorků → {fname} ✓ (časovač)")
+        self.rec_status_label.setStyleSheet(
+            "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+        )
+
     def _on_rec_toggled(self, checked: bool):
         """Toggle CSV recording on/off."""
         if checked:
+            self._rec_timed_timer.stop()
+            self._rec_timed_deadline = None
             self.recorder.start()
             fname = os.path.basename(self.recorder.filename)
             self.rec_status_label.setText(f"Nahrávám → {fname}")
@@ -1039,9 +1145,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             )
             self.rec_btn.setText("⏹  STOP")
         else:
+            self._rec_timed_timer.stop()
+            self._rec_timed_deadline = None
             n = self.recorder.sample_count
             fname = os.path.basename(self.recorder.filename)
             self.recorder.stop()
+            self.rec_timed_btn.setEnabled(True)
+            self.rec_duration_edit.setEnabled(True)
             self.rec_status_label.setText(f"Uloženo {n:,} vzorků → {fname} ✓")
             self.rec_status_label.setStyleSheet(
                 "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
@@ -1056,8 +1166,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         elapsed = self.recorder.elapsed
         mins, secs = divmod(int(elapsed), 60)
         fname = os.path.basename(self.recorder.filename)
+        extra = ""
+        if self._rec_timed_deadline is not None:
+            rem = max(0.0, self._rec_timed_deadline - time.monotonic())
+            extra = f"  |  zbývá ~{rem:.0f} s"
         self.rec_status_label.setText(
-            f"⏺ {mins:02d}:{secs:02d}  |  {n:,} vzorků  |  {fname}"
+            f"⏺ {mins:02d}:{secs:02d}  |  {n:,} vzorků  |  {fname}{extra}"
         )
 
     # ------------------------------------------------------------------ #
@@ -1204,6 +1318,17 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.timer.start(PLOT_INTERVAL_MS)
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
+    def _resume_plotting_if_paused(self):
+        """Znovu zapne timer a zruší pauzu (např. záložka CSV + zastavené vykreslování = prázdný graf)."""
+        if not self._plot_paused:
+            return
+        self.pause_btn.blockSignals(True)
+        self.pause_btn.setChecked(False)
+        self.pause_btn.blockSignals(False)
+        self._plot_paused = False
+        self.timer.start(PLOT_INTERVAL_MS)
+        self.pause_btn.setText("⏸ Pozastavit vykreslování")
+
     def _on_filter_toggled(self, _state):
         """Při zapnutí filtrů: fixní Y -1..1 mV; při vypnutí: Y autoscale. Aktualizovat text checkboxu."""
         filters_on = self.filter_cb.isChecked()
@@ -1289,6 +1414,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
     def _apply_tab_view_state(self):
         """Sladí _view_mode, titulek a viditelnost CSV ovládání se zvolenou záložkou."""
         idx = self.mode_tabs.currentIndex()
+        if idx == 1:
+            self._resume_plotting_if_paused()
         if idx == 0:
             self._view_mode = "live"
         else:
@@ -1529,6 +1656,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         )
 
     def closeEvent(self, event):
+        self._rec_timed_timer.stop()
+        self._rec_timed_deadline = None
         self.receiver.stop()
         if self.recorder.recording:
             self.recorder.stop()
