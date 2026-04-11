@@ -787,7 +787,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         live_layout.addSpacing(24)
 
-        self.rec_btn = QtWidgets.QPushButton("⏺  REC")
+        self.rec_btn = QtWidgets.QPushButton("Nahrávat")
         self.rec_btn.setFixedWidth(100)
         self.rec_btn.setCheckable(True)
         self.rec_btn.setStyleSheet(
@@ -822,7 +822,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.rec_duration_edit.setValidator(_dur_val)
         live_layout.addWidget(self.rec_duration_edit)
 
-        self.rec_timed_btn = QtWidgets.QPushButton("⏱ REC na čas")
+        self.rec_timed_btn = QtWidgets.QPushButton("Nahrávat dobu")
         self.rec_timed_btn.setFixedWidth(130)
         self.rec_timed_btn.setStyleSheet(
             "QPushButton { background: #333; color: #ccc; font-size: 13px; "
@@ -835,7 +835,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         live_layout.addSpacing(24)
 
         self._plot_paused = False
-        self.pause_btn = QtWidgets.QPushButton("⏸ Pozastavit vykreslování")
+        self.pause_btn = QtWidgets.QPushButton("Pozastavit vykreslování")
         self.pause_btn.setFixedWidth(180)
         self.pause_btn.setCheckable(True)
         self.pause_btn.setStyleSheet(
@@ -849,7 +849,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         live_layout.addStretch()
 
         # --- Záložka „CSV záznam“: načtení souboru a posuvník ---
-        self.load_csv_btn = QtWidgets.QPushButton("📂 Načíst CSV")
+        self.load_csv_btn = QtWidgets.QPushButton("Načíst záznam (.csv)")
         self.load_csv_btn.setFixedWidth(120)
         self.load_csv_btn.setStyleSheet(
             "QPushButton { background: #333; color: #ccc; font-size: 13px; "
