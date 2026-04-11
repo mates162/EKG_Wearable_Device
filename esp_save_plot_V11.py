@@ -677,11 +677,28 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
 
+        # --- Horní záložky: živý signál / přehrávání CSV ---
+        self.mode_tabs = QtWidgets.QTabWidget()
+        self.mode_tabs.setDocumentMode(True)
+        self.mode_tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #444; background: #252525; margin-top: -1px; }\n"
+            "QTabBar::tab { background: #383838; color: #aaa; padding: 10px 28px; "
+            "font-weight: bold; font-size: 13px; border: 1px solid #555; border-bottom: none; "
+            "border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }\n"
+            "QTabBar::tab:selected { background: #1e1e1e; color: #0d0; }\n"
+            "QTabBar::tab:!selected { margin-top: 2px; }"
+        )
+        live_tab = QtWidgets.QWidget()
+        live_layout = QtWidgets.QHBoxLayout(live_tab)
+        live_layout.setContentsMargins(8, 8, 8, 8)
+        csv_tab = QtWidgets.QWidget()
+        csv_layout = QtWidgets.QHBoxLayout(csv_tab)
+        csv_layout.setContentsMargins(8, 8, 8, 8)
+
         # --- pyqtgraph layout ---
         pg.setConfigOptions(antialias=False, useOpenGL=True)
         self.pw = pg.GraphicsLayoutWidget()
         self.pw.setBackground("k")
-        layout.addWidget(self.pw, stretch=1)
 
         # Create one subplot per channel (12 leads), stacked vertically
         self.plots = []
@@ -737,20 +754,15 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._maximized_index = None   # None = all visible, int = maximized channel
         self.pw.scene().sigMouseClicked.connect(self._on_scene_click)
 
-        # --- bottom controls bar ---
-        controls_layout = QtWidgets.QHBoxLayout()
-        controls_layout.setContentsMargins(4, 0, 4, 0)
-
-        # Gain selector
+        # --- Záložka „Živý signál“: gain, záznam, pauza ---
         gain_label = QtWidgets.QLabel("GAIN:")
         gain_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 13px;")
-        controls_layout.addWidget(gain_label)
+        live_layout.addWidget(gain_label)
 
         self.gain_combo = QtWidgets.QComboBox()
         self.gain_combo.setFixedWidth(80)
         for g in VALID_GAINS:
             self.gain_combo.addItem(f"x{g}", g)
-        # Set default to current gain (6)
         default_idx = VALID_GAINS.index(ADS_GAIN)
         self.gain_combo.setCurrentIndex(default_idx)
         self.gain_combo.setStyleSheet(
@@ -761,18 +773,16 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "selection-background-color: #555; }"
         )
         self.gain_combo.currentIndexChanged.connect(self._on_gain_changed)
-        controls_layout.addWidget(self.gain_combo)
+        live_layout.addWidget(self.gain_combo)
 
         self.gain_status_label = QtWidgets.QLabel("")
         self.gain_status_label.setStyleSheet(
             "color: #888; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
-        controls_layout.addWidget(self.gain_status_label)
+        live_layout.addWidget(self.gain_status_label)
 
-        # --- Spacer ---
-        controls_layout.addSpacing(24)
+        live_layout.addSpacing(24)
 
-        # --- REC button ---
         self.rec_btn = QtWidgets.QPushButton("⏺  REC")
         self.rec_btn.setFixedWidth(100)
         self.rec_btn.setCheckable(True)
@@ -782,18 +792,16 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "QPushButton:checked { background: #800; color: #f44; border: 1px solid #f44; }"
         )
         self.rec_btn.clicked.connect(self._on_rec_toggled)
-        controls_layout.addWidget(self.rec_btn)
+        live_layout.addWidget(self.rec_btn)
 
         self.rec_status_label = QtWidgets.QLabel("")
         self.rec_status_label.setStyleSheet(
             "color: #888; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
-        controls_layout.addWidget(self.rec_status_label)
+        live_layout.addWidget(self.rec_status_label)
 
-        # --- Spacer ---
-        controls_layout.addSpacing(24)
+        live_layout.addSpacing(24)
 
-        # --- Pozastavit / Spustit vykreslování ---
         self._plot_paused = False
         self.pause_btn = QtWidgets.QPushButton("⏸ Pozastavit vykreslování")
         self.pause_btn.setFixedWidth(180)
@@ -804,10 +812,41 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "QPushButton:checked { background: #084; color: #4f4; border: 1px solid #4f4; }"
         )
         self.pause_btn.clicked.connect(self._on_pause_toggled)
-        controls_layout.addWidget(self.pause_btn)
+        live_layout.addWidget(self.pause_btn)
 
-        # --- Klinické filtry EKG (0,5–40 Hz + notch) ---
-        controls_layout.addSpacing(24)
+        live_layout.addStretch()
+
+        # --- Záložka „CSV záznam“: načtení souboru a posuvník ---
+        self.load_csv_btn = QtWidgets.QPushButton("📂 Načíst CSV")
+        self.load_csv_btn.setFixedWidth(120)
+        self.load_csv_btn.setStyleSheet(
+            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
+            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+        )
+        self.load_csv_btn.clicked.connect(self._on_load_csv)
+        csv_layout.addWidget(self.load_csv_btn)
+
+        self.csv_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.csv_slider.setMinimum(0)
+        self.csv_slider.setMaximum(0)
+        self.csv_slider.setValue(0)
+        self.csv_slider.setMinimumWidth(200)
+        self.csv_slider.valueChanged.connect(self._on_csv_slider_changed)
+        self.csv_slider.setVisible(False)
+        csv_layout.addWidget(self.csv_slider, stretch=1)
+
+        self.csv_pos_label = QtWidgets.QLabel("")
+        self.csv_pos_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.csv_pos_label.setVisible(False)
+        csv_layout.addWidget(self.csv_pos_label)
+
+        self.mode_tabs.addTab(live_tab, "Živý signál")
+        self.mode_tabs.addTab(csv_tab, "CSV záznam")
+        self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
+
+        # --- Společné klinické filtry (živý proud i CSV) ---
+        filters_layout = QtWidgets.QHBoxLayout()
+        filters_layout.setContentsMargins(8, 4, 8, 4)
         self.filter_cb = QtWidgets.QCheckBox("Klinické filtry: ZAPNUTO")
         self.filter_cb.setChecked(True)
         self.filter_cb.setStyleSheet(
@@ -822,7 +861,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "Pásmový filtr 0,5–40 Hz (baseline + HF šum) a notch 50/60 Hz (síť). Doporučeno pro diagnostické EKG."
         )
         self.filter_cb.stateChanged.connect(self._on_filter_toggled)
-        controls_layout.addWidget(self.filter_cb)
+        filters_layout.addWidget(self.filter_cb)
         self.notch_combo = QtWidgets.QComboBox()
         self.notch_combo.setFixedWidth(70)
         self.notch_combo.addItem("50 Hz", 50.0)
@@ -832,11 +871,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "QComboBox { background: #333; color: #0af; font-size: 12px; border: 1px solid #555; padding: 2px 4px; }"
         )
         self.notch_combo.setToolTip("Frekvence notch filtru (síťové rušení)")
-        controls_layout.addWidget(QtWidgets.QLabel("Notch:"))
-        controls_layout.addWidget(self.notch_combo)
+        filters_layout.addWidget(QtWidgets.QLabel("Notch:"))
+        filters_layout.addWidget(self.notch_combo)
 
-        # --- Autoscale Y: návrat na rozptyl -1 .. 1 mV ---
-        controls_layout.addSpacing(24)
+        filters_layout.addSpacing(24)
         self.autoscale_btn = QtWidgets.QPushButton("Autoscale Y")
         self.autoscale_btn.setFixedWidth(110)
         self.autoscale_btn.setStyleSheet(
@@ -845,10 +883,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         )
         self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
         self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
-        controls_layout.addWidget(self.autoscale_btn)
+        filters_layout.addWidget(self.autoscale_btn)
+        filters_layout.addStretch()
 
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
+        layout.addWidget(self.mode_tabs)
+        layout.addLayout(filters_layout)
+        layout.addWidget(self.pw, stretch=1)
 
         # --- bottom status bar ---
         self.status_label = QtWidgets.QLabel("Spouštím …")
@@ -880,46 +920,6 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_path = None
         self._csv_window_start = 0.0   # začátek okna v sekundách (vztaženo na začátek souboru)
         self._view_mode = "live"       # "live" | "csv"
-
-        # --- Tlačítko Načíst CSV ---
-        self.load_csv_btn = QtWidgets.QPushButton("📂 Načíst CSV")
-        self.load_csv_btn.setFixedWidth(120)
-        self.load_csv_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
-        )
-        self.load_csv_btn.clicked.connect(self._on_load_csv)
-        controls_layout.addWidget(self.load_csv_btn)
-
-        # --- Režim zobrazení: Živý / CSV ---
-        self.view_mode_combo = QtWidgets.QComboBox()
-        self.view_mode_combo.setFixedWidth(140)
-        self.view_mode_combo.addItem("Živý signál", "live")
-        self.view_mode_combo.addItem("Načtený CSV", "csv")
-        self.view_mode_combo.setCurrentIndex(0)
-        self.view_mode_combo.setEnabled(False)
-        self.view_mode_combo.setStyleSheet(
-            "QComboBox { background: #333; color: #0af; font-size: 12px; "
-            "border: 1px solid #555; padding: 2px 6px; }"
-        )
-        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
-        controls_layout.addWidget(QtWidgets.QLabel("Režim:"))
-        controls_layout.addWidget(self.view_mode_combo)
-
-        # --- Slider procházení CSV (viditelný jen v režimu CSV) ---
-        self.csv_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.csv_slider.setMinimum(0)
-        self.csv_slider.setMaximum(0)
-        self.csv_slider.setValue(0)
-        self.csv_slider.setMinimumWidth(200)
-        self.csv_slider.valueChanged.connect(self._on_csv_slider_changed)
-        self.csv_slider.setVisible(False)
-        controls_layout.addWidget(self.csv_slider, stretch=0)
-
-        self.csv_pos_label = QtWidgets.QLabel("")
-        self.csv_pos_label.setStyleSheet("color: #888; font-size: 11px;")
-        self.csv_pos_label.setVisible(False)
-        controls_layout.addWidget(self.csv_pos_label)
 
         # --- recording status update timer ---
         self._rec_timer = QtCore.QTimer()
@@ -1279,29 +1279,32 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_data = (time_sec, data)
         self._csv_path = path
         self._csv_window_start = 0.0
-        self.setWindowTitle(f"ESP32 12-Lead ECG — {os.path.basename(path)}")
-        self.view_mode_combo.setEnabled(True)
-        self.view_mode_combo.setCurrentIndex(1)  # přepnout na "Načtený CSV"
-        self._view_mode = "csv"
         total_sec = float(time_sec[-1]) if time_sec.size else 0.0
         max_start = max(0, total_sec - WINDOW_SEC)
         self.csv_slider.setMaximum(int(max_start * 10))  # krok 0.1 s
         self.csv_slider.setValue(0)
-        self.csv_slider.setVisible(True)
-        self.csv_pos_label.setVisible(True)
-        self._update_csv_pos_label()
+        self.mode_tabs.setCurrentIndex(1)
+        self._apply_tab_view_state()
 
-    def _on_view_mode_changed(self, index):
-        mode = self.view_mode_combo.itemData(index)
-        self._view_mode = mode if mode else "live"
-        self.csv_slider.setVisible(self._view_mode == "csv" and self._csv_data is not None)
-        self.csv_pos_label.setVisible(self._view_mode == "csv" and self._csv_data is not None)
+    def _apply_tab_view_state(self):
+        """Sladí _view_mode, titulek a viditelnost CSV ovládání se zvolenou záložkou."""
+        idx = self.mode_tabs.currentIndex()
+        if idx == 0:
+            self._view_mode = "live"
+        else:
+            self._view_mode = "csv" if self._csv_data is not None else "live"
+        show_csv_ui = idx == 1 and self._csv_data is not None
+        self.csv_slider.setVisible(show_csv_ui)
+        self.csv_pos_label.setVisible(show_csv_ui)
         if self._view_mode == "csv":
-            self._update_csv_pos_label()
             if self._csv_path:
                 self.setWindowTitle(f"ESP32 12-Lead ECG — {os.path.basename(self._csv_path)}")
+            self._update_csv_pos_label()
         else:
             self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+
+    def _on_mode_tab_changed(self, _index: int):
+        self._apply_tab_view_state()
 
     def _on_csv_slider_changed(self, value):
         self._csv_window_start = value / 10.0
