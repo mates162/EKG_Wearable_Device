@@ -126,16 +126,37 @@ def apply_ecg_filters(
     bandpass_high: float = FILTER_BANDPASS_HIGH,
     notch_hz: float | None = 50.0,
 ) -> np.ndarray:
-    """Aplikuje filtry používané při záznamu klinického EKG:
-    - Pásmový filtr 0,5–40 Hz (Butterworth): baseline wander + HF šum
-    - Notch 50/60 Hz: síťové rušení
+    """Zpětná kompatibilita: plný klinický řetězec (HP + LP + případně notch)."""
+    return apply_ecg_filters_chain(
+        data,
+        fs,
+        highpass=True,
+        highpass_hz=bandpass_low,
+        lowpass=True,
+        lowpass_hz=bandpass_high,
+        notch=(notch_hz is not None),
+        notch_hz=float(notch_hz) if notch_hz is not None else 50.0,
+    )
 
-    data: shape (num_channels, N) v mV
-    fs: vzorkovací kmitočet [Hz]
-    notch_hz: None = bez notch, jinak 50 nebo 60
-    Vrací filtrovaná data stejného tvaru. Při nedostupném scipy vrací data beze změny.
+
+def apply_ecg_filters_chain(
+    data: np.ndarray,
+    fs: float,
+    *,
+    highpass: bool = False,
+    highpass_hz: float = FILTER_BANDPASS_LOW,
+    lowpass: bool = False,
+    lowpass_hz: float = FILTER_BANDPASS_HIGH,
+    notch: bool = False,
+    notch_hz: float = 50.0,
+) -> np.ndarray:
+    """Řetězec Butterworth HP / LP a volitelný IIR notch (nezávislé zapnutí).
+
+    data: shape (num_channels, N) v mV. Při nedostupném scipy nebo žádném filtru vrací vstup.
     """
     if not _SCIPY_AVAILABLE:
+        return data
+    if not (highpass or lowpass or notch):
         return data
     if data.size == 0:
         return data
@@ -148,23 +169,43 @@ def apply_ecg_filters(
     if padlen < 1:
         padlen = None
 
-    # Koeficienty spočítat jednou (stejné pro všechny kanály) – výrazná úspora CPU
-    sos_bp = None
-    low = max(0.01, bandpass_low / nyq)
-    high = min(0.99, bandpass_high / nyq)
-    if low < high:
-        sos_bp = butter(FILTER_BANDPASS_ORDER, [low, high], btype="band", output="sos")
+    sos_hp = None
+    sos_lp = None
+    if highpass:
+        fc = float(highpass_hz)
+        if 0 < fc < nyq * 0.99:
+            wn = min(0.99, max(0.001, fc / nyq))
+            sos_hp = butter(FILTER_BANDPASS_ORDER, wn, btype="highpass", output="sos")
+    if lowpass:
+        fc = float(lowpass_hz)
+        if 0 < fc < nyq * 0.99:
+            wn = min(0.99, max(0.001, fc / nyq))
+            sos_lp = butter(FILTER_BANDPASS_ORDER, wn, btype="lowpass", output="sos")
+
+    # Konflikt mezi mezními kmitočty: neaplikovat pásmo, které by nic nedávalo
+    if highpass and lowpass and sos_hp is not None and sos_lp is not None:
+        if highpass_hz >= lowpass_hz:
+            sos_hp = None
+            sos_lp = None
+
     notch_ba = None
-    if notch_hz is not None and 0 < notch_hz < nyq:
-        w0 = notch_hz / nyq
-        if 0.01 < w0 < 0.99:
-            notch_ba = iirnotch(notch_hz, NOTCH_QUALITY, fs)
+    if notch:
+        f0 = float(notch_hz)
+        if 0 < f0 < nyq:
+            w0 = f0 / nyq
+            if 0.01 < w0 < 0.99:
+                notch_ba = iirnotch(f0, NOTCH_QUALITY, fs)
+
+    if sos_hp is None and sos_lp is None and notch_ba is None:
+        return data
 
     out = np.empty_like(data, dtype=np.float64)
     for ch in range(num_ch):
         sig = np.asarray(data[ch], dtype=np.float64)
-        if sos_bp is not None:
-            sig = sosfiltfilt(sos_bp, sig, axis=-1, padtype="odd", padlen=padlen)
+        if sos_hp is not None:
+            sig = sosfiltfilt(sos_hp, sig, axis=-1, padtype="odd", padlen=padlen)
+        if sos_lp is not None:
+            sig = sosfiltfilt(sos_lp, sig, axis=-1, padtype="odd", padlen=padlen)
         if notch_ba is not None:
             b, a = notch_ba
             sig = filtfilt(b, a, sig, axis=-1, padtype="odd", padlen=padlen)
@@ -751,6 +792,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._filtered_t = None
         self._filtered_d = None
         self._filtered_csv_window_start = None  # v CSV režimu invalidace při posunu slideru
+        self._last_filter_cache_key = None
         for p in self.plots:
             p.getViewBox().sigRangeChanged.connect(self._on_y_range_changed)
 
@@ -876,35 +918,82 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.mode_tabs.addTab(csv_tab, "CSV záznam")
         self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
 
-        # --- Společné klinické filtry (živý proud i CSV) ---
+        # --- Společné filtry HP / LP / Notch (živý proud i CSV), každý zvlášť ---
         filters_layout = QtWidgets.QHBoxLayout()
         filters_layout.setContentsMargins(8, 4, 8, 4)
-        self.filter_cb = QtWidgets.QCheckBox("Klinické filtry: ZAPNUTO")
-        self.filter_cb.setChecked(True)
-        self.filter_cb.setStyleSheet(
-            "QCheckBox { font-size: 13px; font-weight: bold; }"
-            "QCheckBox { color: #0c5; }"
-            "QCheckBox:unchecked { color: #666; }"
-            "QCheckBox::indicator { width: 20px; height: 20px; border: 2px solid #555; border-radius: 3px; background: #2a2a2a; }"
-            "QCheckBox:checked::indicator { background: #0a5; border-color: #0f8; }"
-            "QCheckBox:unchecked::indicator { background: #333; }"
-        )
-        self.filter_cb.setToolTip(
-            "Pásmový filtr 0,5–40 Hz (baseline + HF šum) a notch 50/60 Hz (síť). Doporučeno pro diagnostické EKG."
-        )
-        self.filter_cb.stateChanged.connect(self._on_filter_toggled)
-        filters_layout.addWidget(self.filter_cb)
-        self.notch_combo = QtWidgets.QComboBox()
-        self.notch_combo.setFixedWidth(70)
-        self.notch_combo.addItem("50 Hz", 50.0)
-        self.notch_combo.addItem("60 Hz", 60.0)
-        self.notch_combo.setCurrentIndex(0)
-        self.notch_combo.setStyleSheet(
-            "QComboBox { background: #333; color: #0af; font-size: 12px; border: 1px solid #555; padding: 2px 4px; }"
-        )
-        self.notch_combo.setToolTip("Frekvence notch filtru (síťové rušení)")
-        filters_layout.addWidget(QtWidgets.QLabel("Notch:"))
-        filters_layout.addWidget(self.notch_combo)
+        _fe = "QLineEdit { background: #333; color: #eee; border: 1px solid #555; padding: 2px 4px; font-size: 12px; }"
+        _nyq = 0.5 * SAMPLE_RATE
+
+        self.filter_hp_btn = QtWidgets.QPushButton()
+        self.filter_hp_btn.setCheckable(True)
+        self.filter_hp_btn.setChecked(True)
+        self.filter_hp_btn.setToolTip("Horní propust (Butterworth): potlačení pomalé složky / driftu.")
+        self.filter_hp_btn.toggled.connect(self._on_filter_band_toggled)
+        filters_layout.addWidget(self.filter_hp_btn)
+        self.hp_hz_edit = QtWidgets.QLineEdit()
+        self.hp_hz_edit.setFixedWidth(54)
+        self.hp_hz_edit.setText(str(FILTER_BANDPASS_LOW))
+        self.hp_hz_edit.setToolTip("Mezní kmitočet high-pass [Hz]")
+        self.hp_hz_edit.setStyleSheet(_fe)
+        _vhp = QtGui.QDoubleValidator(0.01, _nyq * 0.95, 3, self)
+        _vhp.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        _vhp.setLocale(QtCore.QLocale.system())
+        self.hp_hz_edit.setValidator(_vhp)
+        self.hp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
+        filters_layout.addWidget(self.hp_hz_edit)
+        hz_u = QtWidgets.QLabel("Hz")
+        hz_u.setStyleSheet("color: #aaa; font-size: 12px;")
+        filters_layout.addWidget(hz_u)
+
+        filters_layout.addSpacing(16)
+
+        self.filter_lp_btn = QtWidgets.QPushButton()
+        self.filter_lp_btn.setCheckable(True)
+        self.filter_lp_btn.setChecked(True)
+        self.filter_lp_btn.setToolTip("Dolní propust (Butterworth): potlačení vysokofrekvenčního šumu.")
+        self.filter_lp_btn.toggled.connect(self._on_filter_band_toggled)
+        filters_layout.addWidget(self.filter_lp_btn)
+        self.lp_hz_edit = QtWidgets.QLineEdit()
+        self.lp_hz_edit.setFixedWidth(54)
+        self.lp_hz_edit.setText(str(FILTER_BANDPASS_HIGH))
+        self.lp_hz_edit.setToolTip("Mezní kmitočet low-pass [Hz]")
+        self.lp_hz_edit.setStyleSheet(_fe)
+        _vlp = QtGui.QDoubleValidator(0.05, _nyq * 0.99, 2, self)
+        _vlp.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        _vlp.setLocale(QtCore.QLocale.system())
+        self.lp_hz_edit.setValidator(_vlp)
+        self.lp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
+        filters_layout.addWidget(self.lp_hz_edit)
+        hz_l = QtWidgets.QLabel("Hz")
+        hz_l.setStyleSheet("color: #aaa; font-size: 12px;")
+        filters_layout.addWidget(hz_l)
+
+        filters_layout.addSpacing(16)
+
+        self.filter_notch_btn = QtWidgets.QPushButton()
+        self.filter_notch_btn.setCheckable(True)
+        self.filter_notch_btn.setChecked(True)
+        self.filter_notch_btn.setToolTip("Úzkopásmový zářez (IIR notch) na síťový hum.")
+        self.filter_notch_btn.toggled.connect(self._on_filter_band_toggled)
+        filters_layout.addWidget(self.filter_notch_btn)
+        self.notch_hz_edit = QtWidgets.QLineEdit()
+        self.notch_hz_edit.setFixedWidth(54)
+        self.notch_hz_edit.setText("50")
+        self.notch_hz_edit.setToolTip("Střední frekvence notch [Hz], typicky 50 nebo 60")
+        self.notch_hz_edit.setStyleSheet(_fe)
+        _vn = QtGui.QDoubleValidator(1.0, min(120.0, _nyq * 0.99), 2, self)
+        _vn.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        _vn.setLocale(QtCore.QLocale.system())
+        self.notch_hz_edit.setValidator(_vn)
+        self.notch_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
+        filters_layout.addWidget(self.notch_hz_edit)
+        hz_n = QtWidgets.QLabel("Hz")
+        hz_n.setStyleSheet("color: #aaa; font-size: 12px;")
+        filters_layout.addWidget(hz_n)
+
+        self._set_filter_btn_look(self.filter_hp_btn, "High-pass")
+        self._set_filter_btn_look(self.filter_lp_btn, "Low-pass")
+        self._set_filter_btn_look(self.filter_notch_btn, "Notch")
 
         filters_layout.addSpacing(24)
         self.autoscale_btn = QtWidgets.QPushButton("Autoscale Y")
@@ -917,6 +1006,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
         filters_layout.addWidget(self.autoscale_btn)
         filters_layout.addStretch()
+        self._sync_y_axis_for_filters()
 
         layout.addWidget(self.mode_tabs)
         layout.addLayout(filters_layout)
@@ -1329,11 +1419,82 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.timer.start(PLOT_INTERVAL_MS)
         self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
-    def _on_filter_toggled(self, _state):
-        """Při zapnutí filtrů: fixní Y -1..1 mV; při vypnutí: Y autoscale. Aktualizovat text checkboxu."""
-        filters_on = self.filter_cb.isChecked()
-        if filters_on:
-            self.filter_cb.setText("Klinické filtry: ZAPNUTO")
+    def _set_filter_btn_look(self, btn: QtWidgets.QPushButton, title: str) -> None:
+        """Text a barva tlačítka filtru: ON = zelená, OFF = červená."""
+        on = btn.isChecked()
+        btn.setText(f"{title}  {'ON' if on else 'OFF'}")
+        if on:
+            btn.setStyleSheet(
+                "QPushButton { background-color: #1a5c1a; color: #cfc; font-size: 12px; font-weight: bold; "
+                "border: 2px solid #3a9a3a; border-radius: 4px; padding: 5px 10px; min-width: 118px; }"
+            )
+        else:
+            btn.setStyleSheet(
+                "QPushButton { background-color: #5c1a1a; color: #fcc; font-size: 12px; font-weight: bold; "
+                "border: 2px solid #9a3a3a; border-radius: 4px; padding: 5px 10px; min-width: 118px; }"
+            )
+
+    def _parse_line_hz(self, edit: QtWidgets.QLineEdit, default: float, lo: float, hi: float) -> float:
+        s = edit.text().strip().replace(",", ".")
+        if not s:
+            v = float(default)
+        else:
+            try:
+                v = float(s)
+            except ValueError:
+                v = float(default)
+        if not np.isfinite(v):
+            v = float(default)
+        return float(np.clip(v, lo, hi))
+
+    def _filter_chain_kwargs(self) -> dict:
+        nyq = 0.5 * SAMPLE_RATE
+        return {
+            "highpass": self.filter_hp_btn.isChecked(),
+            "highpass_hz": self._parse_line_hz(self.hp_hz_edit, FILTER_BANDPASS_LOW, 0.01, nyq * 0.95),
+            "lowpass": self.filter_lp_btn.isChecked(),
+            "lowpass_hz": self._parse_line_hz(self.lp_hz_edit, FILTER_BANDPASS_HIGH, 0.05, nyq * 0.99),
+            "notch": self.filter_notch_btn.isChecked(),
+            "notch_hz": self._parse_line_hz(self.notch_hz_edit, 50.0, 1.0, min(120.0, nyq * 0.99)),
+        }
+
+    def _any_filter_enabled(self) -> bool:
+        return (
+            self.filter_hp_btn.isChecked()
+            or self.filter_lp_btn.isChecked()
+            or self.filter_notch_btn.isChecked()
+        )
+
+    def _filter_cache_key_tuple(self) -> tuple:
+        kw = self._filter_chain_kwargs()
+        return (
+            kw["highpass"],
+            round(kw["highpass_hz"], 4),
+            kw["lowpass"],
+            round(kw["lowpass_hz"], 4),
+            kw["notch"],
+            round(kw["notch_hz"], 4),
+        )
+
+    def _invalidate_filter_cache(self) -> None:
+        self._filtered_t = None
+        self._filtered_d = None
+        self._filtered_csv_window_start = None
+        self._last_filter_cache_key = None
+
+    def _on_filter_band_toggled(self) -> None:
+        self._set_filter_btn_look(self.filter_hp_btn, "High-pass")
+        self._set_filter_btn_look(self.filter_lp_btn, "Low-pass")
+        self._set_filter_btn_look(self.filter_notch_btn, "Notch")
+        self._sync_y_axis_for_filters()
+        self._invalidate_filter_cache()
+
+    def _on_filter_hz_edited(self) -> None:
+        self._invalidate_filter_cache()
+
+    def _sync_y_axis_for_filters(self) -> None:
+        """Při zapnutém alespoň jednom filtru: fixní Y -1..1 mV; jinak Y autoscale."""
+        if self._any_filter_enabled():
             self.autoscale_btn.setEnabled(True)
             self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
             for p in self.plots:
@@ -1347,9 +1508,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 self._applying_autoscale = False
             self._last_y_fixed_range_time = time.time()
         else:
-            self.filter_cb.setText("Klinické filtry: VYPNUTO")
             self.autoscale_btn.setEnabled(False)
-            self.autoscale_btn.setToolTip("Dostupné jen při zapnutých klinických filtrech (Y má pak autoscale)")
+            self.autoscale_btn.setToolTip("Dostupné jen při zapnutém alespoň jednom filtru (fixní rozsah Y)")
             for p in self.plots:
                 p.enableAutoRange(axis="y", enable=True)
             self._y_autoscale = False
@@ -1361,7 +1521,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             return
         yr = vb.viewRange()[1]
         ymin, ymax = yr[0], yr[1]
-        if self.filter_cb.isChecked():
+        if self._any_filter_enabled():
             # Při zapnutém filtru: scaling pouze okolo Y=0 – vynutit symetrický rozsah [-span, +span]
             span = max(abs(ymin), abs(ymax), 0.02)  # min span 0.02 mV, aby zoom nebyl nekonečný
             span = min(span, 50.0)  # max 50 mV
@@ -1372,7 +1532,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             finally:
                 self._applying_autoscale = False
             return
-        # Při vypnutém filtru: jen poznámka, že uživatel odchýlil od fixního rozsahu
+        # Při vypnutých filtrech: jen poznámka, že uživatel odchýlil od fixního rozsahu
         tol = 0.05
         if abs(ymin - Y_VIEW_MIN_MV) > tol or abs(ymax - Y_VIEW_MAX_MV) > tol:
             self._y_autoscale = False
@@ -1463,27 +1623,30 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 self._update_status(0, np.array([], dtype=np.uint64), None)
                 return
             d = data[:, mask].astype(np.float64)
-            # Klinické filtry EKG při zobrazení CSV (throttling + invalidace při posunu slideru)
-            if self.filter_cb.isChecked():
+            # Filtry při zobrazení CSV (throttling + invalidace při posunu slideru / změně filtru)
+            if self._any_filter_enabled():
                 now = time.time()
+                fkey = self._filter_cache_key_tuple()
                 cache_valid = (
                     self._filtered_t is not None
                     and self._filtered_csv_window_start == self._csv_window_start
+                    and self._last_filter_cache_key == fkey
                     and (now - self._last_filter_time < FILTER_UPDATE_INTERVAL_S)
                 )
                 if not cache_valid:
-                    notch_hz = self.notch_combo.currentData()
-                    d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
+                    d = apply_ecg_filters_chain(d, SAMPLE_RATE, **self._filter_chain_kwargs())
                     self._filtered_t = t.copy()
                     self._filtered_d = d.copy()
                     self._filtered_csv_window_start = self._csv_window_start
                     self._last_filter_time = now
+                    self._last_filter_cache_key = fkey
                 if self._filtered_t is not None and self._filtered_d is not None:
                     t, d = self._filtered_t, self._filtered_d
             else:
                 self._filtered_t = None
                 self._filtered_d = None
                 self._filtered_csv_window_start = None
+                self._last_filter_cache_key = None
             if not np.all(np.isfinite(t)):
                 t = np.nan_to_num(t.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
             else:
@@ -1495,7 +1658,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 else:
                     ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch.astype(np.float32)
                 self.curves[i].setData(t, ch)
-            if self.filter_cb.isChecked() and self._y_autoscale:
+            if self._any_filter_enabled() and self._y_autoscale:
                 now = time.time()
                 if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                     self._last_y_fixed_range_time = now
@@ -1516,12 +1679,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._update_status(0, np.array([], dtype=np.uint64), None)
             return
 
-        # Klinické filtry EKG: přepočet jen každých FILTER_UPDATE_INTERVAL_S (úspora CPU)
-        if self.filter_cb.isChecked():
+        # Filtry: přepočet jen každých FILTER_UPDATE_INTERVAL_S (úspora CPU)
+        if self._any_filter_enabled():
             now = time.time()
             if (self._filtered_t is None) or (now - self._last_filter_time >= FILTER_UPDATE_INTERVAL_S):
-                notch_hz = self.notch_combo.currentData()
-                d = apply_ecg_filters(d, SAMPLE_RATE, notch_hz=notch_hz)
+                d = apply_ecg_filters_chain(d, SAMPLE_RATE, **self._filter_chain_kwargs())
                 self._filtered_t = t.copy()
                 self._filtered_d = d.copy()
                 self._last_filter_time = now
@@ -1545,7 +1707,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.curves[i].setData(t, ch)
 
         # Y: při zapnutých filtrech a fixním režimu držet -1..1 mV, obnovovat jen občas (ne každý snímek)
-        if self.filter_cb.isChecked() and self._y_autoscale:
+        if self._any_filter_enabled() and self._y_autoscale:
             now = time.time()
             if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                 self._last_y_fixed_range_time = now
