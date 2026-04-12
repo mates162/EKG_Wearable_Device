@@ -63,6 +63,8 @@ NUM_CHANNELS    = NUM_RAW_CH + NUM_DERIVED   # 12 total
 # Ring buffer / display
 WINDOW_SEC      = 10.0               # Seconds of data visible on screen
 WINDOW_SAMPLES  = int(SAMPLE_RATE * WINDOW_SEC)
+# U načteného CSV: o kolik sekund před/po okně rozšířit data pro filtry (krajní artefakty mimo 10 s)
+CSV_FILTER_EDGE_PAD_SEC = 2.0
 
 # Plot refresh interval (ms) — menší = plynulejší, 12 ms ≈ 83 FPS
 PLOT_INTERVAL_MS = 12
@@ -1041,7 +1043,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_data = None   # (time_sec: np.ndarray, data: (12, N)) nebo None
         self._csv_path = None
         self._csv_window_start = 0.0   # začátek okna v sekundách (vztaženo na začátek souboru)
-        self._view_mode = "live"       # "live" | "csv"
+        self._view_mode = "live"       # "live" | "csv" | "csv_idle" (záložka CSV bez souboru)
 
         # --- recording status update timer ---
         self._rec_timer = QtCore.QTimer()
@@ -1408,8 +1410,15 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.timer.start(PLOT_INTERVAL_MS)
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
+    def _clear_plot_curves(self) -> None:
+        """Smaže všechny křivky a nastaví výchozí rozsah osy X (prázdný graf)."""
+        for curve in self.curves:
+            curve.setData([], [])
+        for p in self.plots:
+            p.setXRange(0.0, float(WINDOW_SEC), padding=0)
+
     def _resume_plotting_if_paused(self):
-        """Znovu zapne timer a zruší pauzu (např. záložka CSV + zastavené vykreslování = prázdný graf)."""
+        """Znovu zapne timer a zruší pauzu (např. po úspěšném načtení CSV)."""
         if not self._plot_paused:
             return
         self.pause_btn.blockSignals(True)
@@ -1572,16 +1581,28 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.csv_slider.setValue(0)
         self.mode_tabs.setCurrentIndex(1)
         self._apply_tab_view_state()
+        self._resume_plotting_if_paused()
 
     def _apply_tab_view_state(self):
         """Sladí _view_mode, titulek a viditelnost CSV ovládání se zvolenou záložkou."""
         idx = self.mode_tabs.currentIndex()
+
         if idx == 1:
-            self._resume_plotting_if_paused()
+            self.timer.stop()
+            self._clear_plot_curves()
+            self._invalidate_filter_cache()
+
         if idx == 0:
             self._view_mode = "live"
+            if not self._plot_paused:
+                self.timer.start(PLOT_INTERVAL_MS)
+        elif self._csv_data is not None:
+            self._view_mode = "csv"
+            if not self._plot_paused:
+                self.timer.start(PLOT_INTERVAL_MS)
         else:
-            self._view_mode = "csv" if self._csv_data is not None else "live"
+            self._view_mode = "csv_idle"
+
         show_csv_ui = idx == 1 and self._csv_data is not None
         self.csv_slider.setVisible(show_csv_ui)
         self.csv_pos_label.setVisible(show_csv_ui)
@@ -1591,6 +1612,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._update_csv_pos_label()
         else:
             self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+            if self._view_mode == "csv_idle":
+                self.status_label.setText(
+                    "📂 CSV záznam — načtěte soubor tlačítkem „Načíst záznam (.csv)“. "
+                    "Graf je prázdný do úspěšného načtení."
+                )
 
     def _on_mode_tab_changed(self, _index: int):
         self._apply_tab_view_state()
@@ -1614,12 +1640,22 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         """Called every PLOT_INTERVAL_MS – update curves & status."""
         if self._plot_paused:
             return
+        if self._view_mode == "csv_idle":
+            return
 
         # Režim načteného CSV: zobrazit výřez podle slideru
         if self._view_mode == "csv" and self._csv_data is not None:
             time_sec, data = self._csv_data
             t_end = self._csv_window_start + WINDOW_SEC
-            mask = (time_sec >= self._csv_window_start) & (time_sec <= t_end)
+            t_last = float(time_sec[-1]) if time_sec.size else 0.0
+            # S filtry: načíst širší úsek (okraj mimo obraz), filtrovat, zobrazit jen [start, t_end]
+            if self._any_filter_enabled():
+                pad = CSV_FILTER_EDGE_PAD_SEC
+                ext_t0 = max(0.0, self._csv_window_start - pad)
+                ext_t1 = min(t_last, t_end + pad)
+                mask = (time_sec >= ext_t0) & (time_sec <= ext_t1)
+            else:
+                mask = (time_sec >= self._csv_window_start) & (time_sec <= t_end)
             t = time_sec[mask].astype(np.float32)
             if t.size == 0:
                 self._update_status(0, np.array([], dtype=np.uint64), None)
@@ -1636,14 +1672,21 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     and (now - self._last_filter_time < FILTER_UPDATE_INTERVAL_S)
                 )
                 if not cache_valid:
-                    d = apply_ecg_filters_chain(d, SAMPLE_RATE, **self._filter_chain_kwargs())
+                    d_filt = apply_ecg_filters_chain(d, SAMPLE_RATE, **self._filter_chain_kwargs())
                     self._filtered_t = t.copy()
-                    self._filtered_d = d.copy()
+                    self._filtered_d = d_filt.copy()
                     self._filtered_csv_window_start = self._csv_window_start
                     self._last_filter_time = now
                     self._last_filter_cache_key = fkey
                 if self._filtered_t is not None and self._filtered_d is not None:
-                    t, d = self._filtered_t, self._filtered_d
+                    t_all = self._filtered_t
+                    d_all = self._filtered_d
+                    disp = (t_all >= self._csv_window_start) & (t_all <= t_end)
+                    t = t_all[disp]
+                    d = d_all[:, disp]
+                    if t.size == 0:
+                        self._update_status(0, np.array([], dtype=np.uint64), None)
+                        return
             else:
                 self._filtered_t = None
                 self._filtered_d = None
@@ -1671,7 +1714,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     finally:
                         self._applying_autoscale = False
             for p in self.plots:
-                p.setXRange(self._csv_window_start, min(t_end, float(time_sec[-1])), padding=0)
+                p.setXRange(self._csv_window_start, min(t_end, t_last), padding=0)
             self._update_status(d.shape[1], np.array([], dtype=np.uint64), d if d.shape[1] > 0 else None)
             return
 
