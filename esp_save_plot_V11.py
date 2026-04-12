@@ -67,9 +67,9 @@ WINDOW_SAMPLES  = int(SAMPLE_RATE * WINDOW_SEC)
 # Plot refresh interval (ms) — menší = plynulejší, 12 ms ≈ 83 FPS
 PLOT_INTERVAL_MS = 12
 # Plynulý posun osy X: 0 = žádné, 1 = okamžitý skok; 0.2–0.35 = plynulé sledování
-SCROLL_SMOOTH_ALPHA = 0.28
+SCROLL_SMOOTH_ALPHA = 0.8
 
-# --- Y osa: fixní rozptyl -1..1 mV jen při zapnutých filtrech; při vypnutých filtrech autoscale ---
+# --- Y osa: fixní rozptyl -1..1 mV jen při zapnutém high-pass; jinak autoscale osy Y ---
 Y_SPAN_MV = 2.0   # rozptyl v mV (rozsah -1 .. 1 mV)
 Y_VIEW_MIN_MV = -1.0
 Y_VIEW_MAX_MV = 1.0
@@ -783,7 +783,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.plots.append(p)
             self.curves.append(curve)
 
-        # --- Y: při zapnutých filtrech fixní -1..1 mV (kolečko pustí, Autoscale vrátí); při vypnutých filtrech autoscale ---
+        # --- Y: při zapnutém high-pass fixní -1..1 mV (Autoscale Y vrátí); bez HP autoscale ---
         self._y_autoscale = True
         self._applying_autoscale = False
         self._last_y_fixed_range_time = 0.0
@@ -1002,7 +1002,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "QPushButton { background: #333; color: #0af; font-size: 13px; "
             "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
         )
-        self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
+        self.autoscale_btn.setToolTip("Nastaví osu Y na -1 až 1 mV (jen při zapnutém High-pass)")
         self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
         filters_layout.addWidget(self.autoscale_btn)
         filters_layout.addStretch()
@@ -1493,10 +1493,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._invalidate_filter_cache()
 
     def _sync_y_axis_for_filters(self) -> None:
-        """Při zapnutém alespoň jednom filtru: fixní Y -1..1 mV; jinak Y autoscale."""
-        if self._any_filter_enabled():
+        """Fixní Y -1..1 mV jen při zapnutém high-pass; jinak autoscale osy Y."""
+        if self.filter_hp_btn.isChecked():
             self.autoscale_btn.setEnabled(True)
-            self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
+            self.autoscale_btn.setToolTip(
+                "Nastaví osu Y všech kanálů na -1 až 1 mV (jen při zapnutém High-pass)"
+            )
             for p in self.plots:
                 p.enableAutoRange(axis="y", enable=False)
             self._y_autoscale = True
@@ -1509,7 +1511,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._last_y_fixed_range_time = time.time()
         else:
             self.autoscale_btn.setEnabled(False)
-            self.autoscale_btn.setToolTip("Dostupné jen při zapnutém alespoň jednom filtru (fixní rozsah Y)")
+            self.autoscale_btn.setToolTip("Dostupné jen při zapnutém filtru High-pass (fixní rozsah Y)")
             for p in self.plots:
                 p.enableAutoRange(axis="y", enable=True)
             self._y_autoscale = False
@@ -1521,8 +1523,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             return
         yr = vb.viewRange()[1]
         ymin, ymax = yr[0], yr[1]
-        if self._any_filter_enabled():
-            # Při zapnutém filtru: scaling pouze okolo Y=0 – vynutit symetrický rozsah [-span, +span]
+        if self.filter_hp_btn.isChecked():
+            # Při zapnutém high-pass: scaling pouze okolo Y=0 – symetrický rozsah [-span, +span]
             span = max(abs(ymin), abs(ymax), 0.02)  # min span 0.02 mV, aby zoom nebyl nekonečný
             span = min(span, 50.0)  # max 50 mV
             self._y_autoscale = False
@@ -1532,13 +1534,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             finally:
                 self._applying_autoscale = False
             return
-        # Při vypnutých filtrech: jen poznámka, že uživatel odchýlil od fixního rozsahu
+        # Bez high-pass: poznámka k odchýlení od výchozího rozsahu -1..1 mV
         tol = 0.05
         if abs(ymin - Y_VIEW_MIN_MV) > tol or abs(ymax - Y_VIEW_MAX_MV) > tol:
             self._y_autoscale = False
 
     def _on_autoscale_clicked(self):
-        """Nastavit všechny kanály na rozptyl -1 .. 1 mV."""
+        """Nastavit všechny kanály na rozptyl -1 .. 1 mV (při zapnutém High-pass)."""
         self._y_autoscale = True
         self._applying_autoscale = True
         try:
@@ -1658,7 +1660,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 else:
                     ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch.astype(np.float32)
                 self.curves[i].setData(t, ch)
-            if self._any_filter_enabled() and self._y_autoscale:
+            if self.filter_hp_btn.isChecked() and self._y_autoscale:
                 now = time.time()
                 if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                     self._last_y_fixed_range_time = now
@@ -1706,8 +1708,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch
             self.curves[i].setData(t, ch)
 
-        # Y: při zapnutých filtrech a fixním režimu držet -1..1 mV, obnovovat jen občas (ne každý snímek)
-        if self._any_filter_enabled() and self._y_autoscale:
+        # Y: při zapnutém high-pass a fixním režimu držet -1..1 mV, obnovovat jen občas
+        if self.filter_hp_btn.isChecked() and self._y_autoscale:
             now = time.time()
             if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                 self._last_y_fixed_range_time = now
