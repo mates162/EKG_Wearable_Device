@@ -270,6 +270,9 @@ UI_SLIDER_QSS = (
 # Directory where this script lives – CSV files are saved here by default
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR   = os.path.join(SCRIPT_DIR, "logs")
+# Logo v pravém horním rohu okna: PNG vedle skriptu (stejná složka jako tento .py). Chybí-li soubor, řádek se nepřidá.
+APP_LOGO_PATH = os.path.join(SCRIPT_DIR, "450 FEI-CZ.png")
+APP_LOGO_MAX_HEIGHT_PX = 90
 
 # CSV column headers (matches existing log format)
 CSV_HEADER = [
@@ -1061,6 +1064,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.mode_tabs.addTab(live_tab, "Živý signál")
         self.mode_tabs.addTab(csv_tab, "CSV záznam")
         self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
+
+        self._logo_label = None
+        _logo_pix = QtGui.QPixmap(APP_LOGO_PATH) if os.path.isfile(APP_LOGO_PATH) else QtGui.QPixmap()
+        if not _logo_pix.isNull():
+            self._logo_label = QtWidgets.QLabel()
+            self._logo_label.setAlignment(QtCore.Qt.AlignCenter)
+            self._logo_label.setStyleSheet("background: transparent; margin-left: 8px; margin-right: 2px;")
+            _scaled = _logo_pix.scaledToHeight(
+                APP_LOGO_MAX_HEIGHT_PX, QtCore.Qt.SmoothTransformation
+            )
+            self._logo_label.setPixmap(_scaled)
+            self.mode_tabs.setCornerWidget(self._logo_label, QtCore.Qt.TopRightCorner)
 
         # --- Společné filtry HP / LP / Notch (živý proud i CSV), každý zvlášť ---
         filters_layout = QtWidgets.QHBoxLayout()
