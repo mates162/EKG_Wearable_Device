@@ -43,7 +43,7 @@ import pyqtgraph as pg
 from PyQt5 import QtWidgets, QtCore, QtGui
 
 try:
-    from scipy.signal import butter, filtfilt, iirnotch, sosfilt, sosfiltfilt
+    from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
     _SCIPY_AVAILABLE = True
 except ImportError:
     _SCIPY_AVAILABLE = False
@@ -67,11 +67,12 @@ WINDOW_SAMPLES  = int(SAMPLE_RATE * WINDOW_SEC)
 # Plot refresh interval (ms) — menší = plynulejší, 12 ms ≈ 83 FPS
 PLOT_INTERVAL_MS = 12
 # Plynulý posun osy X: 0 = žádné, 1 = okamžitý skok; 0.2–0.35 = plynulé sledování
-SCROLL_SMOOTH_ALPHA = 0.8
+SCROLL_SMOOTH_ALPHA = 0.28
 
-# --- Y osa: fixní rozsah -0,5 až 0,5 mV jen při zapnutém high-pass; jinak autoscale osy Y ---
-Y_HP_VIEW_MIN_MV = -0.5
-Y_HP_VIEW_MAX_MV = 0.5
+# --- Y osa: fixní rozptyl -1..1 mV jen při zapnutých filtrech; při vypnutých filtrech autoscale ---
+Y_SPAN_MV = 2.0   # rozptyl v mV (rozsah -1 .. 1 mV)
+Y_VIEW_MIN_MV = -1.0
+Y_VIEW_MAX_MV = 1.0
 # Jak často obnovit fixní rozsah Y (s), aby to neškubalo a nezpomalovalo
 Y_FIXED_RANGE_INTERVAL_S = 0.4
 # Jak často přepočítat klinické filtry (s) – menší = plynulejší, větší = úspora CPU
@@ -761,7 +762,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setMouseEnabled(x=False, y=True)
             p.enableAutoRange(axis="y", enable=False)
-            p.setYRange(Y_HP_VIEW_MIN_MV, Y_HP_VIEW_MAX_MV, padding=0)
+            p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
             p.setClipToView(True)
             p.setDownsampling(mode='peak')
             # Compact vertical height
@@ -782,7 +783,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.plots.append(p)
             self.curves.append(curve)
 
-        # --- Y: při zapnutém high-pass fixní −0,5 až 0,5 mV (kolečko pustí, Autoscale Y vrátí); bez HP autoscale ---
+        # --- Y: při zapnutých filtrech fixní -1..1 mV (kolečko pustí, Autoscale vrátí); při vypnutých filtrech autoscale ---
         self._y_autoscale = True
         self._applying_autoscale = False
         self._last_y_fixed_range_time = 0.0
@@ -891,7 +892,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         # --- Záložka „CSV záznam“: načtení souboru a posuvník ---
         self.load_csv_btn = QtWidgets.QPushButton("Načíst záznam (.csv)")
-        self.load_csv_btn.setFixedWidth(120)
+        self.load_csv_btn.setFixedWidth(160)
         self.load_csv_btn.setStyleSheet(
             "QPushButton { background: #333; color: #ccc; font-size: 13px; "
             "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
@@ -1001,7 +1002,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             "QPushButton { background: #333; color: #0af; font-size: 13px; "
             "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
         )
-        self.autoscale_btn.setToolTip("Nastaví osu Y na −0,5 až 0,5 mV (jen při zapnutém High-pass)")
+        self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
         self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
         filters_layout.addWidget(self.autoscale_btn)
         filters_layout.addStretch()
@@ -1041,8 +1042,6 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_path = None
         self._csv_window_start = 0.0   # začátek okna v sekundách (vztaženo na začátek souboru)
         self._view_mode = "live"       # "live" | "csv"
-        # Na záložce CSV bez načteného souboru: timer vypnutý, graf prázdný
-        self._csv_awaiting_file = False
 
         # --- recording status update timer ---
         self._rec_timer = QtCore.QTimer()
@@ -1409,19 +1408,16 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.timer.start(PLOT_INTERVAL_MS)
             self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
-    def _prepare_csv_tab_idle(self) -> None:
-        """Přechod na záložku CSV: zastavit vykreslování, vyčistit graf a zrušit načtená data."""
-        self._csv_awaiting_file = True
-        self.timer.stop()
-        self._invalidate_filter_cache()
-        self._csv_data = None
-        self._csv_path = None
-        self._csv_window_start = 0.0
-        self.csv_slider.setMaximum(0)
-        self.csv_slider.setValue(0)
-        for c in self.curves:
-            c.setData([], [])
-        self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+    def _resume_plotting_if_paused(self):
+        """Znovu zapne timer a zruší pauzu (např. záložka CSV + zastavené vykreslování = prázdný graf)."""
+        if not self._plot_paused:
+            return
+        self.pause_btn.blockSignals(True)
+        self.pause_btn.setChecked(False)
+        self.pause_btn.blockSignals(False)
+        self._plot_paused = False
+        self.timer.start(PLOT_INTERVAL_MS)
+        self.pause_btn.setText("⏸ Pozastavit vykreslování")
 
     def _set_filter_btn_look(self, btn: QtWidgets.QPushButton, title: str) -> None:
         """Text a barva tlačítka filtru: ON = zelená, OFF = červená."""
@@ -1497,52 +1493,57 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._invalidate_filter_cache()
 
     def _sync_y_axis_for_filters(self) -> None:
-        """Fixní Y -0,5 až 0,5 mV jen při zapnutém high-pass; jinak autoscale osy Y."""
-        if self.filter_hp_btn.isChecked():
+        """Při zapnutém alespoň jednom filtru: fixní Y -1..1 mV; jinak Y autoscale."""
+        if self._any_filter_enabled():
             self.autoscale_btn.setEnabled(True)
-            self.autoscale_btn.setToolTip(
-                "Nastaví osu Y všech kanálů na −0,5 až 0,5 mV (jen při zapnutém High-pass)"
-            )
+            self.autoscale_btn.setToolTip("Nastaví osu Y všech kanálů na -1 až 1 mV (rozptyl 2 mV)")
             for p in self.plots:
                 p.enableAutoRange(axis="y", enable=False)
             self._y_autoscale = True
             self._applying_autoscale = True
             try:
                 for p in self.plots:
-                    p.setYRange(Y_HP_VIEW_MIN_MV, Y_HP_VIEW_MAX_MV, padding=0)
+                    p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
             finally:
                 self._applying_autoscale = False
             self._last_y_fixed_range_time = time.time()
         else:
             self.autoscale_btn.setEnabled(False)
-            self.autoscale_btn.setToolTip("Dostupné jen při zapnutém filtru High-pass (fixní rozsah Y)")
+            self.autoscale_btn.setToolTip("Dostupné jen při zapnutém alespoň jednom filtru (fixní rozsah Y)")
             for p in self.plots:
                 p.enableAutoRange(axis="y", enable=True)
             self._y_autoscale = False
 
     def _on_y_range_changed(self, vb, _range):
-        """Při zapnutém high-pass: Y symetricky kolem 0 (zoom okolo Y=0). Jinak autoscale bez vynucení."""
+        """Při zapnutém filtru: vynutit Y vždy symetricky kolem 0 (zoom jen okolo Y=0).
+        Při vypnutém filtru: při manuální změně jen vypnout fixní -1..1 mV."""
         if self._applying_autoscale:
             return
         yr = vb.viewRange()[1]
         ymin, ymax = yr[0], yr[1]
-        if self.filter_hp_btn.isChecked():
-            span = max(abs(ymin), abs(ymax), 0.02)
-            span = min(span, 50.0)
+        if self._any_filter_enabled():
+            # Při zapnutém filtru: scaling pouze okolo Y=0 – vynutit symetrický rozsah [-span, +span]
+            span = max(abs(ymin), abs(ymax), 0.02)  # min span 0.02 mV, aby zoom nebyl nekonečný
+            span = min(span, 50.0)  # max 50 mV
             self._y_autoscale = False
             self._applying_autoscale = True
             try:
                 vb.setYRange(-span, span, padding=0)
             finally:
                 self._applying_autoscale = False
+            return
+        # Při vypnutých filtrech: jen poznámka, že uživatel odchýlil od fixního rozsahu
+        tol = 0.05
+        if abs(ymin - Y_VIEW_MIN_MV) > tol or abs(ymax - Y_VIEW_MAX_MV) > tol:
+            self._y_autoscale = False
 
     def _on_autoscale_clicked(self):
-        """Nastavit všechny kanály na rozptyl −0,5 až 0,5 mV (při zapnutém High-pass)."""
+        """Nastavit všechny kanály na rozptyl -1 .. 1 mV."""
         self._y_autoscale = True
         self._applying_autoscale = True
         try:
             for p in self.plots:
-                p.setYRange(Y_HP_VIEW_MIN_MV, Y_HP_VIEW_MAX_MV, padding=0)
+                p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
         finally:
             self._applying_autoscale = False
 
@@ -1563,42 +1564,23 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_data = (time_sec, data)
         self._csv_path = path
         self._csv_window_start = 0.0
-        self._csv_awaiting_file = False
         total_sec = float(time_sec[-1]) if time_sec.size else 0.0
         max_start = max(0, total_sec - WINDOW_SEC)
         self.csv_slider.setMaximum(int(max_start * 10))  # krok 0.1 s
         self.csv_slider.setValue(0)
-        if self.mode_tabs.currentIndex() != 1:
-            self.mode_tabs.blockSignals(True)
-            self.mode_tabs.setCurrentIndex(1)
-            self.mode_tabs.blockSignals(False)
-        self._apply_tab_view_state(skip_csv_idle_reset=True)
-        if self._plot_paused:
-            self.pause_btn.blockSignals(True)
-            self.pause_btn.setChecked(False)
-            self.pause_btn.blockSignals(False)
-            self._plot_paused = False
-            self.pause_btn.setText("⏸ Pozastavit vykreslování")
-        self.timer.start(PLOT_INTERVAL_MS)
+        self.mode_tabs.setCurrentIndex(1)
+        self._apply_tab_view_state()
 
-    def _apply_tab_view_state(self, skip_csv_idle_reset: bool = False):
+    def _apply_tab_view_state(self):
         """Sladí _view_mode, titulek a viditelnost CSV ovládání se zvolenou záložkou."""
         idx = self.mode_tabs.currentIndex()
-        if idx == 1 and not skip_csv_idle_reset:
-            self._prepare_csv_tab_idle()
-        elif idx == 0:
-            self._csv_awaiting_file = False
-            if not self._plot_paused:
-                self.timer.start(PLOT_INTERVAL_MS)
+        if idx == 1:
+            self._resume_plotting_if_paused()
         if idx == 0:
             self._view_mode = "live"
         else:
-            self._view_mode = (
-                "csv"
-                if self._csv_data is not None and not self._csv_awaiting_file
-                else "live"
-            )
-        show_csv_ui = idx == 1 and self._csv_data is not None and not self._csv_awaiting_file
+            self._view_mode = "csv" if self._csv_data is not None else "live"
+        show_csv_ui = idx == 1 and self._csv_data is not None
         self.csv_slider.setVisible(show_csv_ui)
         self.csv_pos_label.setVisible(show_csv_ui)
         if self._view_mode == "csv":
@@ -1629,8 +1611,6 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
     def _update(self):
         """Called every PLOT_INTERVAL_MS – update curves & status."""
         if self._plot_paused:
-            return
-        if self.mode_tabs.currentIndex() == 1 and self._csv_awaiting_file:
             return
 
         # Režim načteného CSV: zobrazit výřez podle slideru
@@ -1678,14 +1658,14 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 else:
                     ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch.astype(np.float32)
                 self.curves[i].setData(t, ch)
-            if self.filter_hp_btn.isChecked() and self._y_autoscale:
+            if self._any_filter_enabled() and self._y_autoscale:
                 now = time.time()
                 if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                     self._last_y_fixed_range_time = now
                     self._applying_autoscale = True
                     try:
                         for p in self.plots:
-                            p.setYRange(Y_HP_VIEW_MIN_MV, Y_HP_VIEW_MAX_MV, padding=0)
+                            p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
                     finally:
                         self._applying_autoscale = False
             for p in self.plots:
@@ -1726,15 +1706,15 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 ch = ch.astype(np.float32) if ch.dtype != np.float32 else ch
             self.curves[i].setData(t, ch)
 
-        # Y: při zapnutém high-pass a fixním režimu držet −0,5 až 0,5 mV, obnovovat jen občas
-        if self.filter_hp_btn.isChecked() and self._y_autoscale:
+        # Y: při zapnutých filtrech a fixním režimu držet -1..1 mV, obnovovat jen občas (ne každý snímek)
+        if self._any_filter_enabled() and self._y_autoscale:
             now = time.time()
             if now - self._last_y_fixed_range_time >= Y_FIXED_RANGE_INTERVAL_S:
                 self._last_y_fixed_range_time = now
                 self._applying_autoscale = True
                 try:
                     for p in self.plots:
-                        p.setYRange(Y_HP_VIEW_MIN_MV, Y_HP_VIEW_MAX_MV, padding=0)
+                        p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
                 finally:
                     self._applying_autoscale = False
 
