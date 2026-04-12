@@ -831,8 +831,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         live_layout.addSpacing(24)
 
-        self.rec_btn = QtWidgets.QPushButton("Nahrávat")
-        self.rec_btn.setFixedWidth(100)
+        self.rec_btn = QtWidgets.QPushButton("Spustit nahrávání")
+        self.rec_btn.setFixedWidth(140)
         self.rec_btn.setCheckable(True)
         self.rec_btn.setStyleSheet(
             "QPushButton { background: #333; color: #ccc; font-size: 13px; "
@@ -1193,7 +1193,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.rec_duration_edit.setEnabled(False)
         self.rec_btn.blockSignals(True)
         self.rec_btn.setChecked(True)
-        self.rec_btn.setText("⏹  STOP")
+        self.rec_btn.setText("Zastavit nahrávání")
         self.rec_btn.blockSignals(False)
         fname = os.path.basename(self.recorder.filename)
         self.rec_status_label.setText(
@@ -1215,11 +1215,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.recorder.stop()
         self.rec_btn.blockSignals(True)
         self.rec_btn.setChecked(False)
-        self.rec_btn.setText("⏺  REC")
+        self.rec_btn.setText("Spustit nahrávání")
         self.rec_btn.blockSignals(False)
         self.rec_timed_btn.setEnabled(True)
         self.rec_duration_edit.setEnabled(True)
-        self.rec_status_label.setText(f"Uloženo {n:,} vzorků → {fname} ✓ (časovač)")
+        self.rec_status_label.setText(f"Uloženo {n:,} vzorků - {fname} (časovač)")
         self.rec_status_label.setStyleSheet(
             "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
@@ -1235,7 +1235,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.rec_status_label.setStyleSheet(
                 "color: #f44; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
             )
-            self.rec_btn.setText("⏹  STOP")
+            self.rec_btn.setText("Zastavit nahrávání")
         else:
             self._rec_timed_timer.stop()
             self._rec_timed_deadline = None
@@ -1244,11 +1244,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.recorder.stop()
             self.rec_timed_btn.setEnabled(True)
             self.rec_duration_edit.setEnabled(True)
-            self.rec_status_label.setText(f"Uloženo {n:,} vzorků → {fname} ✓")
+            self.rec_status_label.setText(f"Uloženo {n:,} vzorků - {fname}")
             self.rec_status_label.setStyleSheet(
                 "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
             )
-            self.rec_btn.setText("⏺  REC")
+            self.rec_btn.setText("Spustit nahrávání")
 
     def _update_rec_status(self):
         """Periodically update recording indicator."""
@@ -1263,7 +1263,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             rem = max(0.0, self._rec_timed_deadline - time.monotonic())
             extra = f"  |  zbývá ~{rem:.0f} s"
         self.rec_status_label.setText(
-            f"⏺ {mins:02d}:{secs:02d}  |  {n:,} vzorků  |  {fname}{extra}"
+            f"{mins:02d}:{secs:02d}  |  {n:,} vzorků  |  {fname}{extra}"
         )
 
     # ------------------------------------------------------------------ #
