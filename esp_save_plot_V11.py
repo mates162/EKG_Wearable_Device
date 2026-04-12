@@ -934,6 +934,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         filters_layout.setContentsMargins(8, 4, 8, 4)
         _fe = "QLineEdit { background: #333; color: #eee; border: 1px solid #555; padding: 2px 4px; font-size: 12px; }"
         _nyq = 0.5 * SAMPLE_RATE
+        # C locale = desetinná tečka; shoda s hodnotami z Python str() a s _parse_line_hz (nahrazuje čárku)
+        _loc_dot = QtCore.QLocale.c()
 
         self.filter_hp_btn = QtWidgets.QPushButton()
         self.filter_hp_btn.setCheckable(True)
@@ -948,7 +950,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.hp_hz_edit.setStyleSheet(_fe)
         _vhp = QtGui.QDoubleValidator(0.01, _nyq * 0.95, 3, self)
         _vhp.setNotation(QtGui.QDoubleValidator.StandardNotation)
-        _vhp.setLocale(QtCore.QLocale.system())
+        _vhp.setLocale(_loc_dot)
         self.hp_hz_edit.setValidator(_vhp)
         self.hp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.hp_hz_edit)
@@ -971,7 +973,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.lp_hz_edit.setStyleSheet(_fe)
         _vlp = QtGui.QDoubleValidator(0.05, _nyq * 0.99, 2, self)
         _vlp.setNotation(QtGui.QDoubleValidator.StandardNotation)
-        _vlp.setLocale(QtCore.QLocale.system())
+        _vlp.setLocale(_loc_dot)
         self.lp_hz_edit.setValidator(_vlp)
         self.lp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.lp_hz_edit)
@@ -994,7 +996,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.notch_hz_edit.setStyleSheet(_fe)
         _vn = QtGui.QDoubleValidator(1.0, min(120.0, _nyq * 0.99), 2, self)
         _vn.setNotation(QtGui.QDoubleValidator.StandardNotation)
-        _vn.setLocale(QtCore.QLocale.system())
+        _vn.setLocale(_loc_dot)
         self.notch_hz_edit.setValidator(_vn)
         self.notch_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.notch_hz_edit)
