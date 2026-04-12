@@ -228,21 +228,37 @@ CHANNEL_LABELS = [
     "V1",  "V2",  "V3",  "V4",  "V5",  "V6",
 ]
 
-CHANNEL_COLORS = [
-    (  0, 200,   0),   # I    – green
-    (  0, 120, 255),   # II   – blue
-    (  0, 180, 180),   # III  – teal
-    (200, 100,   0),   # aVR  – brown
-    (180,   0, 255),   # aVL  – purple
-    (255, 165,   0),   # aVF  – orange
-    (255,  80,  80),   # V1   – red
-    (255, 200,  40),   # V2   – yellow
-    (100, 255, 100),   # V3   – lime
-    (  0, 210, 210),   # V4   – cyan
-    (255, 100, 200),   # V5   – pink
-    (200, 200, 200),   # V6   – white
-]
+# Dříve barevné svody; aktuálně jednotné černé křivky na světlém pozadí
+CHANNEL_COLORS = [(0, 0, 0)] * NUM_CHANNELS
 
+# --- Světlý motiv UI (akcent #05C3DE) ---
+UI_ACCENT = "#05C3DE"
+UI_ACCENT_DIM = "#9adce8"
+UI_BG = "#ffffff"
+UI_TEXT = "#000000"
+UI_TEXT_MUTED = "#333333"
+UI_BORDER = "#b8dce5"
+UI_BTN_BG = "#eef8fb"
+UI_OK = "#0d6b4d"
+UI_ERR = "#b00020"
+UI_WARN = "#c26600"
+
+# PyQtGraph osa Y: velikost titulku (HTML) a čísel značek (QFont bodů)
+Y_AXIS_LABEL_FONT_PT = "11pt"
+Y_AXIS_TICK_FONT_POINT = 11
+# rezerva pro šířku/výšku textu značek při daném fontu
+Y_AXIS_TICK_TEXT_WIDTH = 42
+Y_AXIS_TICK_TEXT_HEIGHT = 22
+
+# Spodní osa: stejná rezervovaná výška u všech 12 grafů (jen poslední má popisky Čas → jinak by se V6 vizuálně zmenšoval)
+PLOT_BOTTOM_AXIS_HEIGHT_PX = 5
+
+# QSlider na Windows často nezvládne border-radius / záporné margin u subcontrols → chyba parseru stylů
+UI_SLIDER_QSS = (
+    f"QSlider::groove:horizontal {{ border: 1px solid {UI_BORDER}; height: 8px; background: {UI_BTN_BG}; }}"
+    f"QSlider::handle:horizontal {{ background: {UI_ACCENT}; border: 1px solid {UI_ACCENT}; "
+    f"width: 14px; height: 14px; margin: 0px; }}"
+)
 
 # Directory where this script lives – CSV files are saved here by default
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -704,6 +720,57 @@ class TcpReceiver(threading.Thread):
 # REAL-TIME PLOT WINDOW  (PyQtGraph)
 # =============================================================================
 
+
+class LeftAxisHorizontalLabelItem(pg.AxisItem):
+    """Levá osa s vodorovným titulkem (PyQtGraph jinak otáčí popisek o −90°)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__("left", *args, **kwargs)
+        self.label.setRotation(0)
+        self.picture = None
+
+    def resizeEvent(self, ev=None):
+        """Titulek uvnitř pruhu osy (kladné X), jinak ho View ořízne / nezobrazí."""
+        if self.label is None:
+            self.picture = None
+            return
+        br = self.label.boundingRect()
+        pad_x = 4
+        p = QtCore.QPointF(pad_x, (self.size().height() - br.height()) / 2.0)
+        self.label.setPos(p)
+        self.picture = None
+
+    def _updateWidth(self):
+        if not self.isVisible():
+            w = 0
+        elif self.fixedWidth is None:
+            if not self.style["showValues"]:
+                w = 0
+            elif self.style["autoExpandTextSpace"]:
+                w = self.textWidth
+            else:
+                w = self.style["tickTextWidth"]
+            w += self.style["tickTextOffset"][0] if self.style["showValues"] else 0
+            w += max(0, self.style["tickLength"])
+            if self.label.isVisible():
+                w += self.label.boundingRect().width() * 0.92 + 4
+        else:
+            w = self.fixedWidth
+        w = int(max(w, 1))
+        self.setMaximumWidth(w)
+        self.setMinimumWidth(w)
+        self.picture = None
+
+    def boundingRect(self):
+        r = super().boundingRect()
+        if self.label is not None and self.label.isVisible():
+            try:
+                r = r.united(self.label.mapRectToParent(self.label.boundingRect()))
+            except Exception:
+                pass
+        return r
+
+
 class ECGPlotWindow(QtWidgets.QMainWindow):
     """Main window with stacked ECG channel subplots and a status bar."""
 
@@ -727,6 +794,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
+        central.setStyleSheet(f"background-color: {UI_BG};")
 
         # --- Horní záložky: živý signál / přehrávání CSV ---
         self.mode_tabs = QtWidgets.QTabWidget()
@@ -735,13 +803,14 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         tab_bar.setElideMode(QtCore.Qt.ElideNone)
         tab_bar.setUsesScrollButtons(False)
         self.mode_tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #444; background: #252525; }\n"
-            "QTabBar::tab { background: #383838; color: #aaa; "
+            f"QTabWidget::pane {{ border: 1px solid {UI_BORDER}; background: {UI_BG}; }}\n"
+            f"QTabBar::tab {{ background: {UI_BTN_BG}; color: {UI_TEXT_MUTED}; "
             "min-height: 28px; min-width: 8em; padding: 8px 20px; "
-            "font-weight: bold; font-size: 13px; border: 1px solid #555; "
-            "border-bottom-color: #444; border-top-left-radius: 4px; border-top-right-radius: 4px; "
-            "margin-right: 2px; }\n"
-            "QTabBar::tab:selected { background: #1e1e1e; color: #0d0; border-bottom-color: #1e1e1e; }"
+            "font-weight: bold; font-size: 13px; border: 1px solid "
+            f"{UI_BORDER}; border-bottom-color: {UI_BORDER}; border-top-left-radius: 4px; "
+            "border-top-right-radius: 4px; margin-right: 2px; }\n"
+            f"QTabBar::tab:selected {{ background: {UI_BG}; color: {UI_ACCENT}; "
+            f"border-bottom-color: {UI_BG}; font-weight: bold; }}"
         )
         live_tab = QtWidgets.QWidget()
         live_layout = QtWidgets.QHBoxLayout(live_tab)
@@ -750,10 +819,17 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         csv_layout = QtWidgets.QHBoxLayout(csv_tab)
         csv_layout.setContentsMargins(8, 8, 8, 8)
 
-        # --- pyqtgraph layout ---
+        # --- pyqtgraph layout (světlé pozadí, černé osy a signál) ---
         pg.setConfigOptions(antialias=False, useOpenGL=True)
+        pg.setConfigOption("foreground", "k")
+        pg.setConfigOption("background", "w")
         self.pw = pg.GraphicsLayoutWidget()
-        self.pw.setBackground("k")
+        self.pw.setBackground("w")
+
+        _axis_tick_pen = pg.mkPen("#888888", width=1)
+        _axis_text_pen = pg.mkPen(UI_TEXT, width=1)
+        _y_axis_tick_font = QtGui.QFont()
+        _y_axis_tick_font.setPointSize(Y_AXIS_TICK_FONT_POINT)
 
         # Create one subplot per channel (12 leads), stacked vertically
         self.plots = []
@@ -761,15 +837,33 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         for i in range(NUM_CHANNELS):
             if i > 0:
                 self.pw.nextRow()
-            p = self.pw.addPlot()
+            left_axis = LeftAxisHorizontalLabelItem()
+            p = self.pw.addPlot(axisItems={"left": left_axis})
+            if hasattr(p, "setBackground"):
+                p.setBackground(pg.mkBrush(UI_BG))
             # Jednotky "mV" v textu popisku – bez units= v API, aby PyQtGraph neaplikoval SI předpony (mmV) a neškáloval hodnoty
-            p.setLabel("left", f"{CHANNEL_LABELS[i]}, mV", units="")
-            left_axis = p.getAxis("left")
-            left_axis.setStyle(tickTextWidth=52, autoExpandTextSpace=False)
+            p.setLabel(
+                "left",
+                f"{CHANNEL_LABELS[i]} (mV)",
+                units="",
+                color=UI_TEXT,
+                **{"font-size": Y_AXIS_LABEL_FONT_PT},
+            )
+            # Sloupec pro čísla (mV) + větší písmo značek; tickTextOffset = jedno int (horiz. u levé osy)
+            left_axis.setStyle(
+                tickTextWidth=Y_AXIS_TICK_TEXT_WIDTH,
+                tickTextHeight=Y_AXIS_TICK_TEXT_HEIGHT,
+                tickTextOffset=2,
+                autoExpandTextSpace=False,
+                tickFont=_y_axis_tick_font,
+            )
+            left_axis.setPen(_axis_tick_pen)
+            if hasattr(left_axis, "setTextPen"):
+                left_axis.setTextPen(_axis_text_pen)
             # Zakázat automatické SI předpony na ose Y – hodnoty zůstávají v mV (0.2, 0.5, 1.0), ne ve stovkách
             if hasattr(left_axis, "enableAutoSIPrefix"):
                 left_axis.enableAutoSIPrefix(False)
-            p.showGrid(x=True, y=True, alpha=0.25)
+            p.showGrid(x=True, y=True, alpha=0.35)
             p.setMouseEnabled(x=False, y=True)
             p.enableAutoRange(axis="y", enable=False)
             p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
@@ -782,17 +876,30 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             if i < NUM_CHANNELS - 1:
                 p.getAxis("bottom").setStyle(showValues=False)
             else:
-                p.setLabel("bottom", "Čas", units="s")
+                p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
+            _bx = p.getAxis("bottom")
+            _bx.setPen(_axis_tick_pen)
+            if hasattr(_bx, "setTextPen"):
+                _bx.setTextPen(_axis_text_pen)
 
             # Link X axes for synchronised zoom/pan
             if i > 0:
                 p.setXLink(self.plots[0])
 
-            # pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
-            pen = pg.mkPen(color="white", width=1.2)
+            pen = pg.mkPen(color="k", width=1.2)
             curve = p.plot(pen=pen)
             self.plots.append(p)
             self.curves.append(curve)
+
+        # Stejná šířka levého pruhu u všech kanálů → zarovnání grafů; max z auto-výpočtu
+        _axis_w = max(int(p.getAxis("left").width()) for p in self.plots)
+        _axis_w = max(_axis_w, 130)
+        for p in self.plots:
+            p.getAxis("left").setWidth(_axis_w)
+        for p in self.plots:
+            p.getAxis("left").resizeEvent()
+
+        self._sync_bottom_axis_heights()
 
         # --- Y: při zapnutém high-pass fixní -1..1 mV (Autoscale Y vrátí); bez HP autoscale ---
         self._y_autoscale = True
@@ -813,7 +920,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         # --- Záložka „Živý signál“: gain, záznam, pauza ---
         gain_label = QtWidgets.QLabel("GAIN:")
-        gain_label.setStyleSheet("color: #ccc; font-weight: bold; font-size: 13px;")
+        gain_label.setStyleSheet(
+            f"color: {UI_ACCENT}; font-weight: bold; font-size: 13px;"
+        )
         live_layout.addWidget(gain_label)
 
         self.gain_combo = QtWidgets.QComboBox()
@@ -823,18 +932,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         default_idx = VALID_GAINS.index(ADS_GAIN)
         self.gain_combo.setCurrentIndex(default_idx)
         self.gain_combo.setStyleSheet(
-            "QComboBox { background: #333; color: #0f0; font-size: 13px; "
-            "border: 1px solid #555; padding: 2px 6px; }"
-            "QComboBox::drop-down { border: none; }"
-            "QComboBox QAbstractItemView { background: #333; color: #0f0; "
-            "selection-background-color: #555; }"
+            f"QComboBox {{ background: {UI_BG}; color: {UI_TEXT}; font-size: 13px; "
+            f"border: 1px solid {UI_BORDER}; padding: 2px 6px; border-radius: 3px; }}"
+            "QComboBox::drop-down { border: none; width: 18px; }"
+            f"QComboBox QAbstractItemView {{ background: {UI_BG}; color: {UI_TEXT}; "
+            f"selection-background-color: {UI_ACCENT_DIM}; selection-color: {UI_TEXT}; }}"
         )
         self.gain_combo.currentIndexChanged.connect(self._on_gain_changed)
         live_layout.addWidget(self.gain_combo)
 
         self.gain_status_label = QtWidgets.QLabel("")
         self.gain_status_label.setStyleSheet(
-            "color: #888; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+            f"color: {UI_TEXT_MUTED}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
         live_layout.addWidget(self.gain_status_label)
 
@@ -844,30 +953,30 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.rec_btn.setFixedWidth(140)
         self.rec_btn.setCheckable(True)
         self.rec_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
-            "QPushButton:checked { background: #800; color: #f44; border: 1px solid #f44; }"
+            f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_TEXT}; font-size: 13px; "
+            f"font-weight: bold; border: 1px solid {UI_BORDER}; padding: 2px 8px; border-radius: 3px; }}"
+            f"QPushButton:checked {{ background: #ffebee; color: {UI_ERR}; border: 2px solid {UI_ERR}; }}"
         )
         self.rec_btn.clicked.connect(self._on_rec_toggled)
         live_layout.addWidget(self.rec_btn)
 
         self.rec_status_label = QtWidgets.QLabel("")
         self.rec_status_label.setStyleSheet(
-            "color: #888; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+            f"color: {UI_TEXT_MUTED}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
         live_layout.addWidget(self.rec_status_label)
 
         live_layout.addSpacing(16)
         dur_lbl = QtWidgets.QLabel("Délka (s):")
-        dur_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+        dur_lbl.setStyleSheet(f"color: {UI_TEXT_MUTED}; font-size: 12px;")
         live_layout.addWidget(dur_lbl)
         self.rec_duration_edit = QtWidgets.QLineEdit()
         self.rec_duration_edit.setFixedWidth(64)
         self.rec_duration_edit.setPlaceholderText("60")
         self.rec_duration_edit.setToolTip("Délka časované nahrávky v sekundách (desetinná čárka i tečka).")
         self.rec_duration_edit.setStyleSheet(
-            "QLineEdit { background: #333; color: #eee; border: 1px solid #555; "
-            "padding: 2px 6px; font-size: 13px; }"
+            f"QLineEdit {{ background: {UI_BG}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; "
+            "padding: 2px 6px; font-size: 13px; border-radius: 3px; }"
         )
         _dur_val = QtGui.QDoubleValidator(0.1, 86400.0, 2, self)
         _dur_val.setNotation(QtGui.QDoubleValidator.StandardNotation)
@@ -878,8 +987,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.rec_timed_btn = QtWidgets.QPushButton("Nahrávat dobu")
         self.rec_timed_btn.setFixedWidth(130)
         self.rec_timed_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+            f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_ACCENT}; font-size: 13px; "
+            f"font-weight: bold; border: 1px solid {UI_ACCENT}; padding: 2px 8px; border-radius: 3px; }}"
         )
         self.rec_timed_btn.setToolTip("Spustí nahrávání a po zadaném počtu sekund ji ukončí.")
         self.rec_timed_btn.clicked.connect(self._on_rec_timed_clicked)
@@ -892,9 +1001,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.pause_btn.setFixedWidth(180)
         self.pause_btn.setCheckable(True)
         self.pause_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
-            "QPushButton:checked { background: #084; color: #4f4; border: 1px solid #4f4; }"
+            f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_TEXT}; font-size: 13px; "
+            f"font-weight: bold; border: 1px solid {UI_BORDER}; padding: 2px 8px; border-radius: 3px; }}"
+            f"QPushButton:checked {{ background: {UI_ACCENT_DIM}; color: {UI_TEXT}; "
+            f"border: 2px solid {UI_ACCENT}; }}"
         )
         self.pause_btn.clicked.connect(self._on_pause_toggled)
         live_layout.addWidget(self.pause_btn)
@@ -905,8 +1015,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.load_csv_btn = QtWidgets.QPushButton("Načíst záznam (.csv)")
         self.load_csv_btn.setFixedWidth(160)
         self.load_csv_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #ccc; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+            f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_ACCENT}; font-size: 13px; "
+            f"font-weight: bold; border: 1px solid {UI_ACCENT}; padding: 2px 8px; border-radius: 3px; }}"
         )
         self.load_csv_btn.clicked.connect(self._on_load_csv)
         csv_layout.addWidget(self.load_csv_btn)
@@ -918,10 +1028,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.csv_slider.setMinimumWidth(200)
         self.csv_slider.valueChanged.connect(self._on_csv_slider_changed)
         self.csv_slider.setVisible(False)
+        self.csv_slider.setStyleSheet(UI_SLIDER_QSS)
         csv_layout.addWidget(self.csv_slider, stretch=1)
 
         self.csv_pos_label = QtWidgets.QLabel("")
-        self.csv_pos_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.csv_pos_label.setStyleSheet(f"color: {UI_TEXT_MUTED}; font-size: 11px;")
         self.csv_pos_label.setVisible(False)
         csv_layout.addWidget(self.csv_pos_label)
 
@@ -932,7 +1043,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         # --- Společné filtry HP / LP / Notch (živý proud i CSV), každý zvlášť ---
         filters_layout = QtWidgets.QHBoxLayout()
         filters_layout.setContentsMargins(8, 4, 8, 4)
-        _fe = "QLineEdit { background: #333; color: #eee; border: 1px solid #555; padding: 2px 4px; font-size: 12px; }"
+        _fe = (
+            f"QLineEdit {{ background: {UI_BG}; color: {UI_TEXT}; border: 1px solid {UI_BORDER}; "
+            "padding: 2px 4px; font-size: 12px; border-radius: 3px; }"
+        )
         _nyq = 0.5 * SAMPLE_RATE
         # C locale = desetinná tečka; shoda s hodnotami z Python str() a s _parse_line_hz (nahrazuje čárku)
         _loc_dot = QtCore.QLocale.c()
@@ -955,7 +1069,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.hp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.hp_hz_edit)
         hz_u = QtWidgets.QLabel("Hz")
-        hz_u.setStyleSheet("color: #aaa; font-size: 12px;")
+        hz_u.setStyleSheet(f"color: {UI_ACCENT}; font-size: 12px;")
         filters_layout.addWidget(hz_u)
 
         filters_layout.addSpacing(16)
@@ -978,7 +1092,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.lp_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.lp_hz_edit)
         hz_l = QtWidgets.QLabel("Hz")
-        hz_l.setStyleSheet("color: #aaa; font-size: 12px;")
+        hz_l.setStyleSheet(f"color: {UI_ACCENT}; font-size: 12px;")
         filters_layout.addWidget(hz_l)
 
         filters_layout.addSpacing(16)
@@ -1001,7 +1115,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.notch_hz_edit.editingFinished.connect(self._on_filter_hz_edited)
         filters_layout.addWidget(self.notch_hz_edit)
         hz_n = QtWidgets.QLabel("Hz")
-        hz_n.setStyleSheet("color: #aaa; font-size: 12px;")
+        hz_n.setStyleSheet(f"color: {UI_ACCENT}; font-size: 12px;")
         filters_layout.addWidget(hz_n)
 
         self._set_filter_btn_look(self.filter_hp_btn, "Filtr horní propusti")
@@ -1012,8 +1126,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.autoscale_btn = QtWidgets.QPushButton("Autoscale Y")
         self.autoscale_btn.setFixedWidth(110)
         self.autoscale_btn.setStyleSheet(
-            "QPushButton { background: #333; color: #0af; font-size: 13px; "
-            "font-weight: bold; border: 1px solid #555; padding: 2px 8px; }"
+            f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_ACCENT}; font-size: 13px; "
+            f"font-weight: bold; border: 1px solid {UI_ACCENT}; padding: 2px 8px; border-radius: 3px; }}"
         )
         self.autoscale_btn.setToolTip("Nastaví osu Y na -1 až 1 mV (jen při zapnutém High-pass)")
         self.autoscale_btn.clicked.connect(self._on_autoscale_clicked)
@@ -1026,7 +1140,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         window_row = QtWidgets.QHBoxLayout()
         window_row.setContentsMargins(8, 2, 8, 4)
         window_lbl = QtWidgets.QLabel("Časové okno:")
-        window_lbl.setStyleSheet("color: #ccc; font-weight: bold; font-size: 12px;")
+        window_lbl.setStyleSheet(
+            f"color: {UI_ACCENT}; font-weight: bold; font-size: 12px;"
+        )
         window_row.addWidget(window_lbl)
         self.window_sec_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.window_sec_slider.setMinimum(int(DISPLAY_WINDOW_SEC_MIN))
@@ -1042,7 +1158,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         window_row.addWidget(self.window_sec_slider)
         self.window_sec_value_label = QtWidgets.QLabel()
         self.window_sec_value_label.setFixedWidth(40)
-        self.window_sec_value_label.setStyleSheet("color: #8c8; font-size: 12px;")
+        self.window_sec_value_label.setStyleSheet(
+            f"color: {UI_TEXT}; font-weight: bold; font-size: 12px;"
+        )
+        self.window_sec_slider.setStyleSheet(UI_SLIDER_QSS)
         window_row.addWidget(self.window_sec_value_label)
         window_row.addStretch(1)
         layout.addLayout(window_row)
@@ -1055,7 +1174,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         # --- bottom status bar ---
         self.status_label = QtWidgets.QLabel("Spouštím …")
         self.status_label.setStyleSheet(
-            "color: #aaa; font-family: Consolas, monospace; font-size: 12px; padding: 2px;"
+            f"color: {UI_TEXT_MUTED}; font-family: Consolas, monospace; font-size: 12px; padding: 4px 2px; "
+            f"background: {UI_BG}; border-top: 1px solid {UI_BORDER};"
         )
         layout.addWidget(self.status_label)
 
@@ -1088,6 +1208,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._rec_timed_timer = QtCore.QTimer(self)
         self._rec_timed_timer.setSingleShot(True)
         self._rec_timed_timer.timeout.connect(self._finish_timed_recording)
+
+    def _sync_bottom_axis_heights(self) -> None:
+        """Stejná výška spodního pruhu u všech grafů — jinak poslední řádek (V6 + Čas) bere víc místa z ViewBox."""
+        h = PLOT_BOTTOM_AXIS_HEIGHT_PX
+        for p in self.plots:
+            p.getAxis("bottom").setHeight(h)
 
     # ------------------------------------------------------------------ #
     def _connect_cmd(self):
@@ -1140,7 +1266,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             return
         self.gain_status_label.setText(f"Nastavuji GAIN x{gain} …")
         self.gain_status_label.setStyleSheet(
-            "color: #ff0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+            f"color: {UI_WARN}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
         # Run in background thread to avoid blocking GUI
         threading.Thread(target=self._apply_gain, args=(gain,), daemon=True).start()
@@ -1176,7 +1302,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             QtCore.QMetaObject.invokeMethod(
                 self.gain_status_label, "setStyleSheet",
                 QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(str, "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;")
+                QtCore.Q_ARG(str, f"color: {UI_OK}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;")
             )
         else:
             QtCore.QMetaObject.invokeMethod(
@@ -1187,7 +1313,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             QtCore.QMetaObject.invokeMethod(
                 self.gain_status_label, "setStyleSheet",
                 QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(str, "color: #f00; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;")
+                QtCore.Q_ARG(str, f"color: {UI_ERR}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;")
             )
 
     # ------------------------------------------------------------------ #
@@ -1234,7 +1360,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             f"Časovaná nahrávka {sec:.1f} s → {fname}"
         )
         self.rec_status_label.setStyleSheet(
-            "color: #f44; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+            f"color: {UI_ERR}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
 
     def _finish_timed_recording(self):
@@ -1255,7 +1381,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.rec_duration_edit.setEnabled(True)
         self.rec_status_label.setText(f"Uloženo {n:,} vzorků - {fname} (časovač)")
         self.rec_status_label.setStyleSheet(
-            "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+            f"color: {UI_OK}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
         )
 
     def _on_rec_toggled(self, checked: bool):
@@ -1267,7 +1393,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             fname = os.path.basename(self.recorder.filename)
             self.rec_status_label.setText(f"Nahrávám → {fname}")
             self.rec_status_label.setStyleSheet(
-                "color: #f44; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+                f"color: {UI_ERR}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
             )
             self.rec_btn.setText("Zastavit nahrávání")
         else:
@@ -1280,7 +1406,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.rec_duration_edit.setEnabled(True)
             self.rec_status_label.setText(f"Uloženo {n:,} vzorků - {fname}")
             self.rec_status_label.setStyleSheet(
-                "color: #0f0; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
+                f"color: {UI_OK}; font-family: Consolas, monospace; font-size: 12px; padding-left: 8px;"
             )
             self.rec_btn.setText("Spustit nahrávání")
 
@@ -1325,11 +1451,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     p.getAxis("bottom").setStyle(showValues=False)
                     p.getAxis("bottom").setLabel(None)
                 else:
-                    p.setLabel("bottom", "Čas", units="s")
+                    p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
                     p.getAxis("bottom").setStyle(showValues=True)
             # Re-link X axes
             for i in range(1, NUM_CHANNELS):
                 self.plots[i].setXLink(self.plots[0])
+            self._sync_bottom_axis_heights()
         else:
             # --- Maximize selected plot ---
             self._maximized_index = index
@@ -1339,19 +1466,15 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     p.setMinimumHeight(200)
                     p.setMaximumHeight(16777215)  # effectively unlimited
                     # Show x-axis on the maximized plot
-                    p.setLabel("bottom", "Čas", units="s")
+                    p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
                     p.getAxis("bottom").setStyle(showValues=True)
-                    # Thicker pen for maximized view
-                    # pen = pg.mkPen(color=CHANNEL_COLORS[i], width=2.0)
-                    pen = pg.mkPen(color="white", width=2.0)
+                    pen = pg.mkPen(color="k", width=2.0)
                     self.curves[i].setPen(pen)
                 else:
                     p.setVisible(False)
                     p.setMinimumHeight(0)
                     p.setMaximumHeight(0)
-                    # Restore normal pen width for hidden plots
-                    #pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
-                    pen = pg.mkPen(color="white", width=1.2)
+                    pen = pg.mkPen(color="k", width=1.2)
                     self.curves[i].setPen(pen)
 
     # ------------------------------------------------------------------ #
@@ -1493,18 +1616,18 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.pause_btn.setText("Pozastavit vykreslování")
 
     def _set_filter_btn_look(self, btn: QtWidgets.QPushButton, title: str) -> None:
-        """Text a barva tlačítka filtru: ON = zelená, OFF = červená."""
+        """Text a barva tlačítka filtru: ON = akcent, OFF = neutrální."""
         on = btn.isChecked()
         btn.setText(f"{title} {'ZAP.' if on else 'VYP.'}")
         if on:
             btn.setStyleSheet(
-                "QPushButton { background-color: #1a5c1a; color: #cfc; font-size: 12px; font-weight: bold; "
-                "border: 2px solid #3a9a3a; border-radius: 4px; padding: 5px 10px; min-width: 118px; }"
+                f"QPushButton {{ background-color: {UI_ACCENT_DIM}; color: {UI_TEXT}; font-size: 12px; font-weight: bold; "
+                f"border: 2px solid {UI_ACCENT}; border-radius: 4px; padding: 5px 10px; min-width: 118px; }}"
             )
         else:
             btn.setStyleSheet(
-                "QPushButton { background-color: #5c1a1a; color: #fcc; font-size: 12px; font-weight: bold; "
-                "border: 2px solid #9a3a3a; border-radius: 4px; padding: 5px 10px; min-width: 118px; }"
+                f"QPushButton {{ background-color: #f0f0f0; color: {UI_TEXT_MUTED}; font-size: 12px; font-weight: bold; "
+                f"border: 2px solid #cccccc; border-radius: 4px; padding: 5px 10px; min-width: 118px; }}"
             )
 
     def _parse_line_hz(self, edit: QtWidgets.QLineEdit, default: float, lo: float, hi: float) -> float:
@@ -1870,7 +1993,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     self._last_hr_str = hr_str
             hr_str = getattr(self, "_last_hr_str", "HR: —")
             self.status_label.setText(
-                f"📂 CSV: {os.path.basename(self._csv_path or '')}   |   "
+                f"CSV: {os.path.basename(self._csv_path or '')}   |   "
                 f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + self._display_window_sec, total_sec):.1f} s / {total_sec:.1f} s   |   "
                 f"Vzorků: {n_samples:,}   |   {hr_str}"
             )
@@ -1954,15 +2077,17 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Dark palette
+    # Světlá paleta (sladěná s UI_ACCENT / bílým pozadím)
     palette = QtGui.QPalette()
-    palette.setColor(QtGui.QPalette.Window,          QtGui.QColor(30, 30, 30))
-    palette.setColor(QtGui.QPalette.WindowText,      QtGui.QColor(200, 200, 200))
-    palette.setColor(QtGui.QPalette.Base,            QtGui.QColor(20, 20, 20))
-    palette.setColor(QtGui.QPalette.AlternateBase,   QtGui.QColor(40, 40, 40))
-    palette.setColor(QtGui.QPalette.Text,            QtGui.QColor(200, 200, 200))
-    palette.setColor(QtGui.QPalette.Button,          QtGui.QColor(50, 50, 50))
-    palette.setColor(QtGui.QPalette.ButtonText,      QtGui.QColor(200, 200, 200))
+    palette.setColor(QtGui.QPalette.Window, QtGui.QColor(UI_BG))
+    palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(UI_TEXT))
+    palette.setColor(QtGui.QPalette.Base, QtGui.QColor(UI_BG))
+    palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#f2f9fb"))
+    palette.setColor(QtGui.QPalette.Text, QtGui.QColor(UI_TEXT))
+    palette.setColor(QtGui.QPalette.Button, QtGui.QColor(UI_BTN_BG))
+    palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(UI_TEXT))
+    palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(UI_ACCENT))
+    palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(UI_TEXT))
     app.setPalette(palette)
 
     win = ECGPlotWindow(ring, receiver, recorder)
