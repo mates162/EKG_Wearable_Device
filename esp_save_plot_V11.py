@@ -250,8 +250,15 @@ Y_AXIS_TICK_FONT_POINT = 11
 Y_AXIS_TICK_TEXT_WIDTH = 42
 Y_AXIS_TICK_TEXT_HEIGHT = 22
 
-# Spodní osa: stejná rezervovaná výška u všech 12 grafů (jen poslední má popisky Čas → jinak by se V6 vizuálně zmenšoval)
-PLOT_BOTTOM_AXIS_HEIGHT_PX = 5
+# Spodní osa: plná výška jen u grafu s popiskem „Čas“; u ostatních jen tenký pruh (jinak 11× prázdný „fake“ spodní pruh = velké mezery)
+PLOT_BOTTOM_AXIS_FALLBACK_MIN_PX = 10
+PLOT_BOTTOM_AXIS_COMPACT_PX = 10
+# Kompaktní titulek osy X (šetří výšku pruhu; čísla značek zůstanou čitelná)
+X_AXIS_LABEL_FONT_PT = "9pt"
+
+# Jen PlotItem min/max — NENASTAVOVAT zároveň setRowMinimumHeight (dvojí minimum + mezery + schované řádky)
+PLOT_ROW_MIN_HEIGHT_PX = 60
+PLOT_ROW_MAX_HEIGHT_PX = 16777215  # prakticky bez stropu; výšku dělí grid rovnoměrně přes stretch
 
 # QSlider na Windows často nezvládne border-radius / záporné margin u subcontrols → chyba parseru stylů
 UI_SLIDER_QSS = (
@@ -784,9 +791,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_path = None
         self._csv_window_start = 0.0
         self._display_window_sec = float(DISPLAY_WINDOW_SEC_DEFAULT)
+        self._maximized_index = None  # None = všechny kanály, int = maximalizovaný (potřeba před _sync_bottom_axis_heights)
 
         self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
-        self.resize(1400, 1100)
+        self.resize(1400, 1280)
 
         # --- central widget ---
         central = QtWidgets.QWidget()
@@ -869,14 +877,22 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             p.setYRange(Y_VIEW_MIN_MV, Y_VIEW_MAX_MV, padding=0)
             p.setClipToView(True)
             p.setDownsampling(mode='peak')
-            # Compact vertical height
-            p.setMinimumHeight(40)
-            p.setMaximumHeight(120)
+            p.setMinimumHeight(PLOT_ROW_MIN_HEIGHT_PX)
+            p.setMaximumHeight(PLOT_ROW_MAX_HEIGHT_PX)
+            p.layout.setContentsMargins(0, 0, 0, 0)
+            p.layout.setVerticalSpacing(0)
+            p.layout.setHorizontalSpacing(0)
             # Hide x-axis labels except last subplot
             if i < NUM_CHANNELS - 1:
                 p.getAxis("bottom").setStyle(showValues=False)
             else:
-                p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
+                p.setLabel(
+                    "bottom",
+                    "Čas",
+                    units="s",
+                    color=UI_TEXT,
+                    **{"font-size": X_AXIS_LABEL_FONT_PT},
+                )
             _bx = p.getAxis("bottom")
             _bx.setPen(_axis_tick_pen)
             if hasattr(_bx, "setTextPen"):
@@ -900,6 +916,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             p.getAxis("left").resizeEvent()
 
         self._sync_bottom_axis_heights()
+        QtCore.QTimer.singleShot(0, self._sync_bottom_axis_heights)
+
+        _gl = self.pw.ci.layout
+        _gl.setVerticalSpacing(0)
+        _gl.setHorizontalSpacing(0)
+        for ri in range(NUM_CHANNELS):
+            _gl.setRowStretchFactor(ri, 1)
 
         # --- Y: při zapnutém high-pass fixní -1..1 mV (Autoscale Y vrátí); bez HP autoscale ---
         self._y_autoscale = True
@@ -915,7 +938,6 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             p.getViewBox().sigRangeChanged.connect(self._on_y_range_changed)
 
         # --- double-click to maximize/restore ---
-        self._maximized_index = None   # None = all visible, int = maximized channel
         self.pw.scene().sigMouseClicked.connect(self._on_scene_click)
 
         # --- Záložka „Živý signál“: gain, záznam, pauza ---
@@ -1209,11 +1231,39 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._rec_timed_timer.setSingleShot(True)
         self._rec_timed_timer.timeout.connect(self._finish_timed_recording)
 
+    def _bottom_axis_auto_height_px(self, measure_plot=None) -> int:
+        """Výška spodní osy u grafu, který má popisek Čas + X značky (obvykle V6 nebo maximalizovaný kanál)."""
+        p_ref = measure_plot if measure_plot is not None else self.plots[-1]
+        bot = p_ref.getAxis("bottom")
+        bot.setHeight(None)
+        bot.picture = None
+        bot._updateHeight()
+        h = int(bot.minimumHeight())
+        if h <= 0:
+            st = bot.style
+            if st["showValues"]:
+                if st["autoExpandTextSpace"]:
+                    h = bot.textHeight
+                else:
+                    h = st["tickTextHeight"]
+                h += st["tickTextOffset"][1]
+            h += max(0, st["tickLength"])
+            if bot.label is not None and bot.label.isVisible():
+                h += int(bot.label.boundingRect().height() * 0.8)
+        return max(h, PLOT_BOTTOM_AXIS_FALLBACK_MIN_PX)
+
     def _sync_bottom_axis_heights(self) -> None:
-        """Stejná výška spodního pruhu u všech grafů — jinak poslední řádek (V6 + Čas) bere víc místa z ViewBox."""
-        h = PLOT_BOTTOM_AXIS_HEIGHT_PX
-        for p in self.plots:
-            p.getAxis("bottom").setHeight(h)
+        """Plná výška spodní osy jen u jednoho grafu (časová osa); ostatní kompaktně — stejná šířka ViewBoxů bez bílých mezer."""
+        if self._maximized_index is not None:
+            h_full = self._bottom_axis_auto_height_px(self.plots[self._maximized_index])
+            for i, p in enumerate(self.plots):
+                bot = p.getAxis("bottom")
+                bot.setHeight(h_full if i == self._maximized_index else PLOT_BOTTOM_AXIS_COMPACT_PX)
+            return
+        h_full = self._bottom_axis_auto_height_px(self.plots[-1])
+        for i, p in enumerate(self.plots):
+            bot = p.getAxis("bottom")
+            bot.setHeight(h_full if i == NUM_CHANNELS - 1 else PLOT_BOTTOM_AXIS_COMPACT_PX)
 
     # ------------------------------------------------------------------ #
     def _connect_cmd(self):
@@ -1444,14 +1494,20 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self._maximized_index = None
             for i, p in enumerate(self.plots):
                 p.setVisible(True)
-                p.setMinimumHeight(40)
-                p.setMaximumHeight(120)
+                p.setMinimumHeight(PLOT_ROW_MIN_HEIGHT_PX)
+                p.setMaximumHeight(PLOT_ROW_MAX_HEIGHT_PX)
                 # Restore x-axis label visibility
                 if i < NUM_CHANNELS - 1:
                     p.getAxis("bottom").setStyle(showValues=False)
                     p.getAxis("bottom").setLabel(None)
                 else:
-                    p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
+                    p.setLabel(
+                        "bottom",
+                        "Čas",
+                        units="s",
+                        color=UI_TEXT,
+                        **{"font-size": X_AXIS_LABEL_FONT_PT},
+                    )
                     p.getAxis("bottom").setStyle(showValues=True)
             # Re-link X axes
             for i in range(1, NUM_CHANNELS):
@@ -1466,7 +1522,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     p.setMinimumHeight(200)
                     p.setMaximumHeight(16777215)  # effectively unlimited
                     # Show x-axis on the maximized plot
-                    p.setLabel("bottom", "Čas", units="s", color=UI_TEXT)
+                    p.setLabel(
+                        "bottom",
+                        "Čas",
+                        units="s",
+                        color=UI_TEXT,
+                        **{"font-size": X_AXIS_LABEL_FONT_PT},
+                    )
                     p.getAxis("bottom").setStyle(showValues=True)
                     pen = pg.mkPen(color="k", width=2.0)
                     self.curves[i].setPen(pen)
@@ -1476,6 +1538,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     p.setMaximumHeight(0)
                     pen = pg.mkPen(color="k", width=1.2)
                     self.curves[i].setPen(pen)
+            self._sync_bottom_axis_heights()
 
     # ------------------------------------------------------------------ #
     # Channels to try for HR auto-selection ((0)I, (1)II, (2)III, (5)aVF – limb leads)
