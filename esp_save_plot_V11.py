@@ -75,9 +75,9 @@ PLOT_INTERVAL_MS = 12
 SCROLL_SMOOTH_ALPHA = 0.8
 
 # --- Y osa: fixní rozptyl -1..1 mV jen při zapnutém high-pass; jinak autoscale osy Y ---
-Y_SPAN_MV = 2.0   # rozptyl v mV (rozsah -1 .. 1 mV)
-Y_VIEW_MIN_MV = -1.0
-Y_VIEW_MAX_MV = 1.0
+Y_SPAN_MV = 3.0   # rozptyl v mV (rozsah -1 .. 1 mV)
+Y_VIEW_MIN_MV = -Y_SPAN_MV/2
+Y_VIEW_MAX_MV = Y_SPAN_MV/2
 # Jak často obnovit fixní rozsah Y (s), aby to neškubalo a nezpomalovalo
 Y_FIXED_RANGE_INTERVAL_S = 0.4
 # Jak často přepočítat klinické filtry (s) – menší = plynulejší, větší = úspora CPU
@@ -788,7 +788,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             if i > 0:
                 p.setXLink(self.plots[0])
 
-            pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
+            # pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
+            pen = pg.mkPen(color="white", width=1.2)
             curve = p.plot(pen=pen)
             self.plots.append(p)
             self.curves.append(curve)
@@ -1339,14 +1340,16 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     p.setLabel("bottom", "Čas", units="s")
                     p.getAxis("bottom").setStyle(showValues=True)
                     # Thicker pen for maximized view
-                    pen = pg.mkPen(color=CHANNEL_COLORS[i], width=2.0)
+                    # pen = pg.mkPen(color=CHANNEL_COLORS[i], width=2.0)
+                    pen = pg.mkPen(color="white", width=2.0)
                     self.curves[i].setPen(pen)
                 else:
                     p.setVisible(False)
                     p.setMinimumHeight(0)
                     p.setMaximumHeight(0)
                     # Restore normal pen width for hidden plots
-                    pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
+                    #pen = pg.mkPen(color=CHANNEL_COLORS[i], width=1.2)
+                    pen = pg.mkPen(color="white", width=1.2)
                     self.curves[i].setPen(pen)
 
     # ------------------------------------------------------------------ #
@@ -1436,10 +1439,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._plot_paused = self.pause_btn.isChecked()
         if self._plot_paused:
             self.timer.stop()
-            self.pause_btn.setText("▶ Spustit vykreslování")
+            self.pause_btn.setText("Spustit vykreslování")
         else:
             self.timer.start(PLOT_INTERVAL_MS)
-            self.pause_btn.setText("⏸ Pozastavit vykreslování")
+            self.pause_btn.setText("Pozastavit vykreslování")
 
     def _clear_plot_curves(self) -> None:
         """Smaže všechny křivky a nastaví výchozí rozsah osy X (prázdný graf)."""
@@ -1485,7 +1488,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.pause_btn.blockSignals(False)
         self._plot_paused = False
         self.timer.start(PLOT_INTERVAL_MS)
-        self.pause_btn.setText("⏸ Pozastavit vykreslování")
+        self.pause_btn.setText("Pozastavit vykreslování")
 
     def _set_filter_btn_look(self, btn: QtWidgets.QPushButton, title: str) -> None:
         """Text a barva tlačítka filtru: ON = zelená, OFF = červená."""
