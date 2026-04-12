@@ -243,6 +243,11 @@ UI_OK = "#0d6b4d"
 UI_ERR = "#b00020"
 UI_WARN = "#c26600"
 
+# Pruh v záložkách (GAIN, nahrávání, CSV): řádek pod lištou tabů + omezení výšky celého QTabWidget (jinak prázdné pole pod řádkem)
+TOOLBAR_TAB_VMARGIN_PX = 5
+TOOLBAR_CONTROL_HEIGHT_PX = 28
+TOOLBAR_TAB_PANE_FUDGE_PX = 6  # okraj rámu pane + drobná rezerva pro DPI / styl
+
 # PyQtGraph osa Y: velikost titulku (HTML) a čísel značek (QFont bodů)
 Y_AXIS_LABEL_FONT_PT = "11pt"
 Y_AXIS_TICK_FONT_POINT = 11
@@ -796,7 +801,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._display_window_sec = float(DISPLAY_WINDOW_SEC_DEFAULT)
         self._maximized_index = None  # None = všechny kanály, int = maximalizovaný (potřeba před _sync_bottom_axis_heights)
 
-        self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+        self.setWindowTitle("ESP32 12-Lead ECG - Real-Time WiFi Plotter")
         self.resize(1400, 1280)
 
         # --- central widget ---
@@ -814,10 +819,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         tab_bar.setElideMode(QtCore.Qt.ElideNone)
         tab_bar.setUsesScrollButtons(False)
         self.mode_tabs.setStyleSheet(
-            f"QTabWidget::pane {{ border: 1px solid {UI_BORDER}; background: {UI_BG}; }}\n"
+            f"QTabWidget::pane {{ border: 1px solid {UI_BORDER}; background: {UI_BG}; padding: 0px; margin: 0px; }}\n"
             f"QTabBar::tab {{ background: {UI_BTN_BG}; color: {UI_TEXT_MUTED}; "
-            "min-height: 28px; min-width: 8em; padding: 8px 20px; "
-            "font-weight: bold; font-size: 13px; border: 1px solid "
+            "min-height: 40px; min-width: 8em; padding: 4px 14px; "
+            "font-weight: bold; font-size: 12px; border: 1px solid "
             f"{UI_BORDER}; border-bottom-color: {UI_BORDER}; border-top-left-radius: 4px; "
             "border-top-right-radius: 4px; margin-right: 2px; }\n"
             f"QTabBar::tab:selected {{ background: {UI_BG}; color: {UI_ACCENT}; "
@@ -825,10 +830,14 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         )
         live_tab = QtWidgets.QWidget()
         live_layout = QtWidgets.QHBoxLayout(live_tab)
-        live_layout.setContentsMargins(8, 8, 8, 8)
+        live_layout.setContentsMargins(8, TOOLBAR_TAB_VMARGIN_PX, 8, TOOLBAR_TAB_VMARGIN_PX)
+        live_layout.setSpacing(6)
+        live_layout.setAlignment(QtCore.Qt.AlignVCenter)
         csv_tab = QtWidgets.QWidget()
         csv_layout = QtWidgets.QHBoxLayout(csv_tab)
-        csv_layout.setContentsMargins(8, 8, 8, 8)
+        csv_layout.setContentsMargins(8, TOOLBAR_TAB_VMARGIN_PX, 8, TOOLBAR_TAB_VMARGIN_PX)
+        csv_layout.setSpacing(6)
+        csv_layout.setAlignment(QtCore.Qt.AlignVCenter)
 
         # --- pyqtgraph layout (světlé pozadí, černé osy a signál) ---
         pg.setConfigOptions(antialias=False, useOpenGL=True)
@@ -952,6 +961,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         self.gain_combo = QtWidgets.QComboBox()
         self.gain_combo.setFixedWidth(80)
+        self.gain_combo.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         for g in VALID_GAINS:
             self.gain_combo.addItem(f"x{g}", g)
         default_idx = VALID_GAINS.index(ADS_GAIN)
@@ -976,6 +986,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         self.rec_btn = QtWidgets.QPushButton("Spustit nahrávání")
         self.rec_btn.setFixedWidth(140)
+        self.rec_btn.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.rec_btn.setCheckable(True)
         self.rec_btn.setStyleSheet(
             f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_TEXT}; font-size: 13px; "
@@ -997,6 +1008,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         live_layout.addWidget(dur_lbl)
         self.rec_duration_edit = QtWidgets.QLineEdit()
         self.rec_duration_edit.setFixedWidth(64)
+        self.rec_duration_edit.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.rec_duration_edit.setPlaceholderText("60")
         self.rec_duration_edit.setToolTip("Délka časované nahrávky v sekundách (desetinná čárka i tečka).")
         self.rec_duration_edit.setStyleSheet(
@@ -1011,6 +1023,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         self.rec_timed_btn = QtWidgets.QPushButton("Nahrávat dobu")
         self.rec_timed_btn.setFixedWidth(130)
+        self.rec_timed_btn.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.rec_timed_btn.setStyleSheet(
             f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_ACCENT}; font-size: 13px; "
             f"font-weight: bold; border: 1px solid {UI_ACCENT}; padding: 2px 8px; border-radius: 3px; }}"
@@ -1024,6 +1037,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._plot_paused = False
         self.pause_btn = QtWidgets.QPushButton("Pozastavit vykreslování")
         self.pause_btn.setFixedWidth(180)
+        self.pause_btn.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.pause_btn.setCheckable(True)
         self.pause_btn.setStyleSheet(
             f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_TEXT}; font-size: 13px; "
@@ -1039,6 +1053,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         # --- Záložka „CSV záznam“: načtení souboru a posuvník ---
         self.load_csv_btn = QtWidgets.QPushButton("Načíst záznam (.csv)")
         self.load_csv_btn.setFixedWidth(160)
+        self.load_csv_btn.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.load_csv_btn.setStyleSheet(
             f"QPushButton {{ background: {UI_BTN_BG}; color: {UI_ACCENT}; font-size: 13px; "
             f"font-weight: bold; border: 1px solid {UI_ACCENT}; padding: 2px 8px; border-radius: 3px; }}"
@@ -1047,6 +1062,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         csv_layout.addWidget(self.load_csv_btn)
 
         self.csv_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.csv_slider.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX)
         self.csv_slider.setMinimum(0)
         self.csv_slider.setMaximum(0)
         self.csv_slider.setValue(0)
@@ -1061,6 +1077,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.csv_pos_label.setVisible(False)
         csv_layout.addWidget(self.csv_pos_label)
 
+        live_tab.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum
+        )
+        csv_tab.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum
+        )
         self.mode_tabs.addTab(live_tab, "Živý signál")
         self.mode_tabs.addTab(csv_tab, "CSV záznam")
         self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
@@ -1076,6 +1098,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             )
             self._logo_label.setPixmap(_scaled)
             self.mode_tabs.setCornerWidget(self._logo_label, QtCore.Qt.TopRightCorner)
+
+        self.mode_tabs.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum
+        )
 
         # --- Společné filtry HP / LP / Notch (živý proud i CSV), každý zvlášť ---
         filters_layout = QtWidgets.QHBoxLayout()
@@ -1245,6 +1271,22 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._rec_timed_timer = QtCore.QTimer(self)
         self._rec_timed_timer.setSingleShot(True)
         self._rec_timed_timer.timeout.connect(self._finish_timed_recording)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self._clamp_mode_tabs_vertical_size)
+
+    def _clamp_mode_tabs_vertical_size(self) -> None:
+        """Zabrání QTabWidget roztáhnout prázdný prostor pod řádkem GAIN (výška = lišta + jeden řádek ovládání)."""
+        tw = self.mode_tabs
+        bar = tw.tabBar()
+        h_bar = bar.height()
+        if h_bar <= 0:
+            h_bar = bar.sizeHint().height()
+        h_row = TOOLBAR_CONTROL_HEIGHT_PX + 2 * TOOLBAR_TAB_VMARGIN_PX
+        total = int(h_bar + h_row + TOOLBAR_TAB_PANE_FUDGE_PX)
+        if total > 0:
+            tw.setFixedHeight(total)
 
     def _bottom_axis_auto_height_px(self, measure_plot=None) -> int:
         """Výška spodní osy u grafu, který má popisek Čas + X značky (obvykle V6 nebo maximalizovaný kanál)."""
@@ -1524,6 +1566,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                         **{"font-size": X_AXIS_LABEL_FONT_PT},
                     )
                     p.getAxis("bottom").setStyle(showValues=True)
+                self.curves[i].setPen(pg.mkPen(color="k", width=1.2))
             # Re-link X axes
             for i in range(1, NUM_CHANNELS):
                 self.plots[i].setXLink(self.plots[0])
@@ -1874,10 +1917,10 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 self.setWindowTitle(f"ESP32 12-Lead ECG — {os.path.basename(self._csv_path)}")
             self._update_csv_pos_label()
         else:
-            self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
+            self.setWindowTitle("ESP32 12-Lead ECG - Real-Time WiFi Plotter")
             if self._view_mode == "csv_idle":
                 self.status_label.setText(
-                    "📂 CSV záznam — načtěte soubor tlačítkem „Načíst záznam (.csv)“. "
+                    "CSV záznam — načtěte soubor tlačítkem „Načíst záznam (.csv)“. "
                     "Graf je prázdný do úspěšného načtení."
                 )
 
