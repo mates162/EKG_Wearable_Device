@@ -61,9 +61,12 @@ NUM_DERIVED     = 4                 # III, aVR, aVL, aVF
 NUM_CHANNELS    = NUM_RAW_CH + NUM_DERIVED   # 12 total
 
 # Ring buffer / display
-WINDOW_SEC      = 10.0               # Seconds of data visible on screen
-WINDOW_SAMPLES  = int(SAMPLE_RATE * WINDOW_SEC)
-# U načteného CSV: o kolik sekund před/po okně rozšířit data pro filtry (krajní artefakty mimo 10 s)
+DISPLAY_WINDOW_SEC_MIN = 1.0
+DISPLAY_WINDOW_SEC_MAX = 30.0
+DISPLAY_WINDOW_SEC_DEFAULT = 5.0
+# Ring musí pojmout nejdelší zobrazované okno (slider)
+RING_BUFFER_SAMPLES = int(SAMPLE_RATE * DISPLAY_WINDOW_SEC_MAX)
+# U načteného CSV: o kolik sekund před/po okně rozšířit data pro filtry (krajní artefakty mimo viditelné okno)
 CSV_FILTER_EDGE_PAD_SEC = 2.0
 
 # Plot refresh interval (ms) — menší = plynulejší, 12 ms ≈ 83 FPS
@@ -709,6 +712,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.ring = ring
         self.receiver = receiver
         self.recorder = recorder
+        self._view_mode = "live"  # "live" | "csv" | "csv_idle"
+        self._csv_data = None
+        self._csv_path = None
+        self._csv_window_start = 0.0
+        self._display_window_sec = float(DISPLAY_WINDOW_SEC_DEFAULT)
 
         self.setWindowTitle("ESP32 12-Lead ECG  —  Real-Time WiFi Plotter (v11)")
         self.resize(1400, 1100)
@@ -993,9 +1001,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         hz_n.setStyleSheet("color: #aaa; font-size: 12px;")
         filters_layout.addWidget(hz_n)
 
-        self._set_filter_btn_look(self.filter_hp_btn, "High-pass")
-        self._set_filter_btn_look(self.filter_lp_btn, "Low-pass")
-        self._set_filter_btn_look(self.filter_notch_btn, "Notch")
+        self._set_filter_btn_look(self.filter_hp_btn, "Filtr horní propusti")
+        self._set_filter_btn_look(self.filter_lp_btn, "Filtr dolní propusti")
+        self._set_filter_btn_look(self.filter_notch_btn, "Filtr pásmové zádrže")
 
         filters_layout.addSpacing(24)
         self.autoscale_btn = QtWidgets.QPushButton("Autoscale Y")
@@ -1011,6 +1019,33 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._sync_y_axis_for_filters()
 
         layout.addWidget(self.mode_tabs)
+
+        window_row = QtWidgets.QHBoxLayout()
+        window_row.setContentsMargins(8, 2, 8, 4)
+        window_lbl = QtWidgets.QLabel("Časové okno:")
+        window_lbl.setStyleSheet("color: #ccc; font-weight: bold; font-size: 12px;")
+        window_row.addWidget(window_lbl)
+        self.window_sec_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.window_sec_slider.setMinimum(int(DISPLAY_WINDOW_SEC_MIN))
+        self.window_sec_slider.setMaximum(int(DISPLAY_WINDOW_SEC_MAX))
+        self.window_sec_slider.setValue(int(DISPLAY_WINDOW_SEC_DEFAULT))
+        _scr = QtWidgets.QApplication.primaryScreen()
+        _qw = max(120, (_scr.availableGeometry().width() // 4) if _scr else 320)
+        self.window_sec_slider.setFixedWidth(_qw)
+        self.window_sec_slider.setToolTip(
+            "Délka viditelného úseku na ose X v sekundách (živý signál i CSV)."
+        )
+        self.window_sec_slider.valueChanged.connect(self._on_window_sec_slider_changed)
+        window_row.addWidget(self.window_sec_slider)
+        self.window_sec_value_label = QtWidgets.QLabel()
+        self.window_sec_value_label.setFixedWidth(40)
+        self.window_sec_value_label.setStyleSheet("color: #8c8; font-size: 12px;")
+        window_row.addWidget(self.window_sec_value_label)
+        window_row.addStretch(1)
+        layout.addLayout(window_row)
+        self._display_window_sec = float(self.window_sec_slider.value())
+        self.window_sec_value_label.setText(f"{self.window_sec_slider.value()} s")
+
         layout.addLayout(filters_layout)
         layout.addWidget(self.pw, stretch=1)
 
@@ -1039,11 +1074,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._cmd_sock = None
         self._cmd_lock = threading.Lock()
 
-        # --- Načtený CSV: zobrazení a procházení ---
-        self._csv_data = None   # (time_sec: np.ndarray, data: (12, N)) nebo None
-        self._csv_path = None
-        self._csv_window_start = 0.0   # začátek okna v sekundách (vztaženo na začátek souboru)
-        self._view_mode = "live"       # "live" | "csv" | "csv_idle" (záložka CSV bez souboru)
+        # --- Načtený CSV: zobrazení a procházení (inicializace výše) ---
 
         # --- recording status update timer ---
         self._rec_timer = QtCore.QTimer()
@@ -1415,7 +1446,35 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         for curve in self.curves:
             curve.setData([], [])
         for p in self.plots:
-            p.setXRange(0.0, float(WINDOW_SEC), padding=0)
+            p.setXRange(0.0, float(self._display_window_sec), padding=0)
+
+    def _on_window_sec_slider_changed(self, value: int) -> None:
+        self._display_window_sec = float(value)
+        self.window_sec_value_label.setText(f"{value} s")
+        self._x_view_min = None
+        self._x_view_max = None
+        self._invalidate_filter_cache()
+        self._sync_csv_slider_range()
+        if self._view_mode == "csv" and self._csv_data is not None:
+            self._update_csv_pos_label()
+
+    def _sync_csv_slider_range(self) -> None:
+        """Maximum posuvníku CSV podle délky souboru a šířky časového okna."""
+        if self._csv_data is None:
+            return
+        time_sec, _ = self._csv_data
+        total_sec = float(time_sec[-1]) if time_sec.size else 0.0
+        w = self._display_window_sec
+        max_start = max(0.0, total_sec - w)
+        mx = int(round(max_start * 10))
+        self.csv_slider.blockSignals(True)
+        self.csv_slider.setMaximum(mx)
+        cur_v = int(round(self._csv_window_start * 10))
+        if cur_v > mx:
+            cur_v = mx
+            self._csv_window_start = cur_v / 10.0
+        self.csv_slider.setValue(cur_v)
+        self.csv_slider.blockSignals(False)
 
     def _resume_plotting_if_paused(self):
         """Znovu zapne timer a zruší pauzu (např. po úspěšném načtení CSV)."""
@@ -1431,7 +1490,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
     def _set_filter_btn_look(self, btn: QtWidgets.QPushButton, title: str) -> None:
         """Text a barva tlačítka filtru: ON = zelená, OFF = červená."""
         on = btn.isChecked()
-        btn.setText(f"{title}  {'ON' if on else 'OFF'}")
+        btn.setText(f"{title} {'ZAP.' if on else 'VYP.'}")
         if on:
             btn.setStyleSheet(
                 "QPushButton { background-color: #1a5c1a; color: #cfc; font-size: 12px; font-weight: bold; "
@@ -1492,9 +1551,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._last_filter_cache_key = None
 
     def _on_filter_band_toggled(self) -> None:
-        self._set_filter_btn_look(self.filter_hp_btn, "High-pass")
-        self._set_filter_btn_look(self.filter_lp_btn, "Low-pass")
-        self._set_filter_btn_look(self.filter_notch_btn, "Notch")
+        self._set_filter_btn_look(self.filter_hp_btn, "Filtr horní propusti")
+        self._set_filter_btn_look(self.filter_lp_btn, "Filtr dolní propusti")
+        self._set_filter_btn_look(self.filter_notch_btn, "Filtr pásmové zádrže")
         self._sync_y_axis_for_filters()
         self._invalidate_filter_cache()
 
@@ -1575,10 +1634,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._csv_data = (time_sec, data)
         self._csv_path = path
         self._csv_window_start = 0.0
-        total_sec = float(time_sec[-1]) if time_sec.size else 0.0
-        max_start = max(0, total_sec - WINDOW_SEC)
-        self.csv_slider.setMaximum(int(max_start * 10))  # krok 0.1 s
         self.csv_slider.setValue(0)
+        self._sync_csv_slider_range()
         self.mode_tabs.setCurrentIndex(1)
         self._apply_tab_view_state()
         self._resume_plotting_if_paused()
@@ -1632,8 +1689,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         time_sec, data = self._csv_data
         n = time_sec.size
         total_sec = float(time_sec[-1]) if n else 0.0
+        w = self._display_window_sec
         self.csv_pos_label.setText(
-            f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + WINDOW_SEC, total_sec):.1f} s / {total_sec:.1f} s  ({n} vzorků)"
+            f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + w, total_sec):.1f} s / {total_sec:.1f} s  ({n} vzorků)"
         )
 
     def _update(self):
@@ -1646,7 +1704,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         # Režim načteného CSV: zobrazit výřez podle slideru
         if self._view_mode == "csv" and self._csv_data is not None:
             time_sec, data = self._csv_data
-            t_end = self._csv_window_start + WINDOW_SEC
+            t_end = self._csv_window_start + self._display_window_sec
             t_last = float(time_sec[-1]) if time_sec.size else 0.0
             # S filtry: načíst širší úsek (okraj mimo obraz), filtrovat, zobrazit jen [start, t_end]
             if self._any_filter_enabled():
@@ -1765,12 +1823,13 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
         # Plynulý scroll osy X: plynulé přibližování k cílovému rozsahu
         t_newest = float(t[-1])
-        t_oldest = t_newest - WINDOW_SEC
+        win = self._display_window_sec
+        t_oldest = t_newest - win
         if not np.isfinite(t_newest):
             t_newest = 0.0
-            t_oldest = -WINDOW_SEC
+            t_oldest = -win
         if not np.isfinite(t_oldest):
-            t_oldest = t_newest - WINDOW_SEC
+            t_oldest = t_newest - win
         alpha = SCROLL_SMOOTH_ALPHA
         if self._x_view_min is None or self._x_view_max is None:
             self._x_view_min, self._x_view_max = t_oldest, t_newest
@@ -1807,7 +1866,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             hr_str = getattr(self, "_last_hr_str", "HR: —")
             self.status_label.setText(
                 f"📂 CSV: {os.path.basename(self._csv_path or '')}   |   "
-                f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + WINDOW_SEC, total_sec):.1f} s / {total_sec:.1f} s   |   "
+                f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + self._display_window_sec, total_sec):.1f} s / {total_sec:.1f} s   |   "
                 f"Vzorků: {n_samples:,}   |   {hr_str}"
             )
             return
@@ -1855,7 +1914,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             f"Vzorků: {pkts:,}   |   "
             f"Frames: {self.receiver.frames_received}   |   "
             f"{rate:.0f} smp/s   |   "
-            f"Buf: {n_samples}/{WINDOW_SAMPLES}   |   "
+            f"Buf: {n_samples}/{RING_BUFFER_SAMPLES}   |   "
             f"Lat: {latency_ms:.1f}ms   |   "
             f"{jitter_str}   |   "
             f"{gain_str}   |   "
@@ -1877,7 +1936,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
 
 def main():
     # Create ring buffer
-    ring = RingBuffer(WINDOW_SAMPLES, NUM_CHANNELS)
+    ring = RingBuffer(RING_BUFFER_SAMPLES, NUM_CHANNELS)
 
     # Create CSV recorder (shared between receiver & GUI)
     recorder = CsvRecorder()
