@@ -8,7 +8,7 @@ leads (III, aVR, aVL, aVF) for full 12-lead display.
 
 Features:
   • ADS1298 status byte validation (0xCx) – bad samples skipped
-  • Full 12-lead ECG display (I, II, III, aVR, aVL, aVF, V1–V6)
+  • Full 12-lead ECG display in two columns (I–aVF | V1–V6)
   • OpenGL-accelerated rendering (~60 FPS)
   • CSV recording with full 500 SPS resolution
   • Remote PGA gain control via TCP command port
@@ -59,6 +59,13 @@ SAMPLE_RATE     = 500.0             # Hz (ADS1298 @ 500 SPS)
 NUM_RAW_CH      = 8                 # 8 ADS1298 raw channels
 NUM_DERIVED     = 4                 # III, aVR, aVL, aVF
 NUM_CHANNELS    = NUM_RAW_CH + NUM_DERIVED   # 12 total
+# Mřížka grafů: dva sloupce po šesti řádcích (levý I–aVF, pravý V1–V6)
+PLOT_GRID_COLS = 2
+PLOT_GRID_ROWS = NUM_CHANNELS // PLOT_GRID_COLS
+# Plná osa X s popiskem „Čas“ pod každým grafem ve spodním řádku sloupce (aVF, V6)
+FULL_BOTTOM_X_AXIS_CHANNEL_INDICES = tuple(
+    i for i in range(NUM_CHANNELS) if (i % PLOT_GRID_ROWS == PLOT_GRID_ROWS - 1)
+)
 
 # Ring buffer / display
 DISPLAY_WINDOW_SEC_MIN = 1.0
@@ -801,8 +808,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._display_window_sec = float(DISPLAY_WINDOW_SEC_DEFAULT)
         self._maximized_index = None  # None = všechny kanály, int = maximalizovaný (potřeba před _sync_bottom_axis_heights)
 
-        self.setWindowTitle("ESP32 12-Lead ECG - Real-Time WiFi Plotter")
-        self.resize(1400, 1280)
+        self.setWindowTitle("ESP32 12ti svodové EKG s ADS1298")
+        self.resize(1900, 1000)
 
         # --- central widget ---
         central = QtWidgets.QWidget()
@@ -851,14 +858,14 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         _y_axis_tick_font = QtGui.QFont()
         _y_axis_tick_font.setPointSize(Y_AXIS_TICK_FONT_POINT)
 
-        # Create one subplot per channel (12 leads), stacked vertically
+        # Dva sloupce po šesti svodech: řádek r = i % 6, sloupec c = i // 6
         self.plots = []
         self.curves = []
         for i in range(NUM_CHANNELS):
-            if i > 0:
-                self.pw.nextRow()
+            row = i % PLOT_GRID_ROWS
+            col = i // PLOT_GRID_ROWS
             left_axis = LeftAxisHorizontalLabelItem()
-            p = self.pw.addPlot(axisItems={"left": left_axis})
+            p = self.pw.addPlot(row=row, col=col, axisItems={"left": left_axis})
             if hasattr(p, "setBackground"):
                 p.setBackground(pg.mkBrush(UI_BG))
             # Jednotky "mV" v textu popisku – bez units= v API, aby PyQtGraph neaplikoval SI předpony (mmV) a neškáloval hodnoty
@@ -894,8 +901,8 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             p.layout.setContentsMargins(0, 0, 0, 0)
             p.layout.setVerticalSpacing(0)
             p.layout.setHorizontalSpacing(0)
-            # Hide x-axis labels except last subplot
-            if i < NUM_CHANNELS - 1:
+            # Popisek osy X jen pod spodními grafy ve sloupcích (aVF, V6)
+            if i not in FULL_BOTTOM_X_AXIS_CHANNEL_INDICES:
                 p.getAxis("bottom").setStyle(showValues=False)
             else:
                 p.setLabel(
@@ -909,6 +916,9 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             _bx.setPen(_axis_tick_pen)
             if hasattr(_bx, "setTextPen"):
                 _bx.setTextPen(_axis_text_pen)
+            # Bez automatických SI předpon (jinak po dlouhém běhu „ks“ místo sekund)
+            if hasattr(_bx, "enableAutoSIPrefix"):
+                _bx.enableAutoSIPrefix(False)
 
             # Link X axes for synchronised zoom/pan
             if i > 0:
@@ -919,22 +929,12 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             self.plots.append(p)
             self.curves.append(curve)
 
-        # Stejná šířka levého pruhu u všech kanálů → zarovnání grafů; max z auto-výpočtu
-        _axis_w = max(int(p.getAxis("left").width()) for p in self.plots)
-        _axis_w = max(_axis_w, 130)
-        for p in self.plots:
-            p.getAxis("left").setWidth(_axis_w)
-        for p in self.plots:
-            p.getAxis("left").resizeEvent()
+        self._sync_left_axis_column_widths()
 
         self._sync_bottom_axis_heights()
         QtCore.QTimer.singleShot(0, self._sync_bottom_axis_heights)
 
-        _gl = self.pw.ci.layout
-        _gl.setVerticalSpacing(0)
-        _gl.setHorizontalSpacing(0)
-        for ri in range(NUM_CHANNELS):
-            _gl.setRowStretchFactor(ri, 1)
+        self._apply_plot_grid_stretch()
 
         # --- Y: při zapnutém high-pass fixní -1..1 mV (Autoscale Y vrátí); bez HP autoscale ---
         self._y_autoscale = True
@@ -1272,9 +1272,45 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self._rec_timed_timer.setSingleShot(True)
         self._rec_timed_timer.timeout.connect(self._finish_timed_recording)
 
+        self._pw_geom_timer = QtCore.QTimer(self)
+        self._pw_geom_timer.setSingleShot(True)
+        self._pw_geom_timer.timeout.connect(self._refresh_pw_after_window_geometry)
+
     def showEvent(self, event):
         super().showEvent(event)
         QtCore.QTimer.singleShot(0, self._clamp_mode_tabs_vertical_size)
+        QtCore.QTimer.singleShot(0, self._refresh_pw_after_window_geometry)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.WindowStateChange and not self.isMinimized():
+            self._pw_geom_timer.start(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.isMinimized():
+            return
+        self._pw_geom_timer.start(120)
+
+    def _refresh_pw_after_window_geometry(self):
+        """Po minimalizaci / restore / změně velikosti okna znovu přepočíst scénu GraphicsView (jinak 0×0 range → miniaturní mřížka)."""
+        if self.isMinimized():
+            return
+        if self.pw.width() < 64 or self.pw.height() < 64:
+            return
+        self.pw.resizeEvent(None)
+        lay = self.pw.ci.layout
+        if lay is not None:
+            if hasattr(lay, "invalidate"):
+                lay.invalidate()
+            lay.activate()
+        self.pw.ci.prepareGeometryChange()
+        self.pw.ci.updateGeometry()
+        for p in self.plots:
+            p.prepareGeometryChange()
+        self.pw.update()
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(0, self._deferred_plot_layout_refresh)
 
     def _clamp_mode_tabs_vertical_size(self) -> None:
         """Zabrání QTabWidget roztáhnout prázdný prostor pod řádkem GAIN (výška = lišta + jeden řádek ovládání)."""
@@ -1289,7 +1325,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             tw.setFixedHeight(total)
 
     def _bottom_axis_auto_height_px(self, measure_plot=None) -> int:
-        """Výška spodní osy u grafu, který má popisek Čas + X značky (obvykle V6 nebo maximalizovaný kanál)."""
+        """Výška spodní osy u grafu s popiskem Čas + X značky (měření z V6 / maximalizovaného kanálu)."""
         p_ref = measure_plot if measure_plot is not None else self.plots[-1]
         bot = p_ref.getAxis("bottom")
         bot.setHeight(None)
@@ -1310,7 +1346,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         return max(h, PLOT_BOTTOM_AXIS_FALLBACK_MIN_PX)
 
     def _sync_bottom_axis_heights(self) -> None:
-        """Plná výška spodní osy jen u jednoho grafu (časová osa); ostatní kompaktně — stejná šířka ViewBoxů bez bílých mezer."""
+        """Plná výška spodní osy u grafů s osou Čas (aVF, V6); jinde kompaktní pruh."""
         if self._maximized_index is not None:
             h_full = self._bottom_axis_auto_height_px(self.plots[self._maximized_index])
             for i, p in enumerate(self.plots):
@@ -1320,7 +1356,51 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         h_full = self._bottom_axis_auto_height_px(self.plots[-1])
         for i, p in enumerate(self.plots):
             bot = p.getAxis("bottom")
-            bot.setHeight(h_full if i == NUM_CHANNELS - 1 else PLOT_BOTTOM_AXIS_COMPACT_PX)
+            bot.setHeight(
+                h_full if i in FULL_BOTTOM_X_AXIS_CHANNEL_INDICES else PLOT_BOTTOM_AXIS_COMPACT_PX
+            )
+
+    def _sync_left_axis_column_widths(self) -> None:
+        """Stejná šířka levého pruhu u všech kanálů (po přestavění mřížky znovu zavolat)."""
+        _axis_w = max(int(p.getAxis("left").width()) for p in self.plots)
+        _axis_w = max(_axis_w, 130)
+        for p in self.plots:
+            p.getAxis("left").setWidth(_axis_w)
+        for p in self.plots:
+            p.getAxis("left").resizeEvent()
+
+    def _apply_plot_grid_stretch(self) -> None:
+        _gl = self.pw.ci.layout
+        _gl.setVerticalSpacing(0)
+        _gl.setHorizontalSpacing(0)
+        for ri in range(PLOT_GRID_ROWS):
+            _gl.setRowStretchFactor(ri, 1)
+        for ci in range(PLOT_GRID_COLS):
+            _gl.setColumnStretchFactor(ci, 1)
+
+    def _rebuild_plot_grid_layout(self, full_span_channel=None):
+        """None = 12 buněk 6×2; číslo kanálu = jeden PlotItem přes celou oblast mřížky (maximalizace)."""
+        layout_ci = self.pw.ci
+        for p in self.plots:
+            try:
+                layout_ci.removeItem(p)
+            except ValueError:
+                pass
+        layout_ci.currentRow = 0
+        layout_ci.currentCol = 0
+        if full_span_channel is None:
+            for i, p in enumerate(self.plots):
+                row = i % PLOT_GRID_ROWS
+                col = i // PLOT_GRID_ROWS
+                layout_ci.addItem(p, row, col, 1, 1)
+        else:
+            layout_ci.addItem(
+                self.plots[full_span_channel],
+                0,
+                0,
+                PLOT_GRID_ROWS,
+                PLOT_GRID_COLS,
+            )
 
     # ------------------------------------------------------------------ #
     def _connect_cmd(self):
@@ -1534,27 +1614,88 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         )
 
     # ------------------------------------------------------------------ #
+    def _plot_index_at_scene_pos(self, pos):
+        """Vrátí index kanálu pod dvojklikem.
+
+        scene().items(pos) s OpenGL vrací řetězce rodičů nepředvídatelně → špatný svod (např. V1 místo III).
+        Spolehlivější: u každého PlotItem sceneBoundingRect().contains(); při více trefách nejmenší plocha,
+        pak nejbližší střed obdélníku (překrývající se chybné bboxy).
+        """
+        hits = []
+        px, py = float(pos.x()), float(pos.y())
+        for i, p in enumerate(self.plots):
+            try:
+                br = p.sceneBoundingRect()
+            except Exception:
+                continue
+            if not br.isValid() or br.width() < 2.0 or br.height() < 2.0:
+                continue
+            if not br.contains(pos):
+                continue
+            cx = 0.5 * (br.left() + br.right())
+            cy = 0.5 * (br.top() + br.bottom())
+            area = float(br.width() * br.height())
+            dist2 = (px - cx) * (px - cx) + (py - cy) * (py - cy)
+            hits.append((area, dist2, i))
+        if not hits:
+            return None
+        hits.sort(key=lambda t: (t[0], t[1]))
+        return hits[0][2]
+
+    def _schedule_layout_refresh_cascade(self):
+        """Dodatečné přepočty po přestavění mřížky (jedna vlna někdy nestačí s OpenGL)."""
+        QtCore.QTimer.singleShot(50, self._refresh_pw_after_window_geometry)
+        QtCore.QTimer.singleShot(200, self._refresh_pw_after_window_geometry)
+
+    def _finalize_plot_grid_layout(self):
+        """Po přidání/odebrání PlotItem z mřížky vynutit přepočet geometrie (jinak zlomené bboxy a divný dvojklik)."""
+        lay = self.pw.ci.layout
+        if lay is not None:
+            if hasattr(lay, "invalidate"):
+                lay.invalidate()
+            lay.activate()
+        self.pw.ci.prepareGeometryChange()
+        self.pw.ci.updateGeometry()
+        for p in self.plots:
+            p.prepareGeometryChange()
+        self.pw.update()
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(0, self._deferred_plot_layout_refresh)
+
+    def _deferred_plot_layout_refresh(self):
+        self.pw.ci.layout.activate()
+        self._sync_left_axis_column_widths()
+        self._sync_bottom_axis_heights()
+        self.pw.update()
+
     def _on_scene_click(self, event):
         """Handle double-click on a subplot to maximize/restore it."""
         if not event.double():
             return
         pos = event.scenePos()
-        for i, p in enumerate(self.plots):
-            if p.sceneBoundingRect().contains(pos):
-                self._toggle_maximize(i)
-                break
+        if self._maximized_index is not None:
+            # Po maximalizaci mají ostatní PlotItem často zastaralý sceneBoundingRect — neiterovat 0..N
+            if self.pw.ci.sceneBoundingRect().contains(pos):
+                self._toggle_maximize(self._maximized_index)
+            return
+        idx = self._plot_index_at_scene_pos(pos)
+        if idx is not None:
+            self._toggle_maximize(idx)
 
     def _toggle_maximize(self, index):
         """Toggle between maximized single-channel view and all-channels view."""
         if self._maximized_index == index:
             # --- Restore all plots ---
             self._maximized_index = None
+            for p in self.plots:
+                p.setXLink(None)
+            self._rebuild_plot_grid_layout(None)
             for i, p in enumerate(self.plots):
                 p.setVisible(True)
                 p.setMinimumHeight(PLOT_ROW_MIN_HEIGHT_PX)
                 p.setMaximumHeight(PLOT_ROW_MAX_HEIGHT_PX)
-                # Restore x-axis label visibility
-                if i < NUM_CHANNELS - 1:
+                # Restore x-axis label visibility (aVF, V6 ve spodním řádku)
+                if i not in FULL_BOTTOM_X_AXIS_CHANNEL_INDICES:
                     p.getAxis("bottom").setStyle(showValues=False)
                     p.getAxis("bottom").setLabel(None)
                 else:
@@ -1570,10 +1711,17 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             # Re-link X axes
             for i in range(1, NUM_CHANNELS):
                 self.plots[i].setXLink(self.plots[0])
+            self._sync_left_axis_column_widths()
             self._sync_bottom_axis_heights()
+            self._apply_plot_grid_stretch()
+            self._finalize_plot_grid_layout()
+            self._schedule_layout_refresh_cascade()
         else:
-            # --- Maximize selected plot ---
+            # --- Maximize selected plot (jedna buňka přes celou šířku mřížky) ---
             self._maximized_index = index
+            for p in self.plots:
+                p.setXLink(None)
+            self._rebuild_plot_grid_layout(index)
             for i, p in enumerate(self.plots):
                 if i == index:
                     p.setVisible(True)
@@ -1592,11 +1740,15 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                     self.curves[i].setPen(pen)
                 else:
                     p.setVisible(False)
-                    p.setMinimumHeight(0)
-                    p.setMaximumHeight(0)
+                    p.setMinimumHeight(PLOT_ROW_MIN_HEIGHT_PX)
+                    p.setMaximumHeight(PLOT_ROW_MAX_HEIGHT_PX)
                     pen = pg.mkPen(color="k", width=1.2)
                     self.curves[i].setPen(pen)
+            self._sync_left_axis_column_widths()
             self._sync_bottom_axis_heights()
+            self._apply_plot_grid_stretch()
+            self._finalize_plot_grid_layout()
+            self._schedule_layout_refresh_cascade()
 
     # ------------------------------------------------------------------ #
     # Channels to try for HR auto-selection ((0)I, (1)II, (2)III, (5)aVF – limb leads)
