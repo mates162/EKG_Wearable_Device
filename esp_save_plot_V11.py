@@ -1048,6 +1048,23 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         self.pause_btn.clicked.connect(self._on_pause_toggled)
         live_layout.addWidget(self.pause_btn)
 
+        self.hr_frame = QtWidgets.QFrame()
+        self.hr_frame.setObjectName("hrFrame")
+        self.hr_frame.setFixedHeight(TOOLBAR_CONTROL_HEIGHT_PX + 4)
+        self.hr_frame.setStyleSheet(
+            f"#hrFrame {{ background-color: {UI_BG}; border: 1px solid {UI_BORDER}; "
+            "border-radius: 4px; }}"
+        )
+        _hr_lay = QtWidgets.QHBoxLayout(self.hr_frame)
+        _hr_lay.setContentsMargins(10, 0, 10, 0)
+        self.hr_status_label = QtWidgets.QLabel("HR: —")
+        self.hr_status_label.setStyleSheet(
+            "color: #c62828; font-family: Consolas, monospace; font-size: 13px; font-weight: bold;"
+        )
+        self.hr_status_label.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
+        _hr_lay.addWidget(self.hr_status_label)
+        live_layout.addWidget(self.hr_frame)
+
         live_layout.addStretch()
 
         # --- Záložka „CSV záznam“: načtení souboru a posuvník ---
@@ -2071,6 +2088,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
         else:
             self.setWindowTitle("ESP32 12-Lead ECG - Real-Time WiFi Plotter")
             if self._view_mode == "csv_idle":
+                self.hr_status_label.setText("HR: —")
                 self.status_label.setText(
                     "CSV záznam — načtěte soubor tlačítkem „Načíst záznam (.csv)“. "
                     "Graf je prázdný do úspěšného načtení."
@@ -2265,10 +2283,11 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                         hr_str = f"HR: {bpm:.0f} BPM ({lead_name})"
                     self._last_hr_str = hr_str
             hr_str = getattr(self, "_last_hr_str", "HR: —")
+            self.hr_status_label.setText(hr_str)
             self.status_label.setText(
                 f"CSV: {os.path.basename(self._csv_path or '')}   |   "
                 f"Čas: {self._csv_window_start:.1f}–{min(self._csv_window_start + self._display_window_sec, total_sec):.1f} s / {total_sec:.1f} s   |   "
-                f"Vzorků: {n_samples:,}   |   {hr_str}"
+                f"Vzorků: {n_samples:,}"
             )
             return
         now = time.time()
@@ -2307,6 +2326,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
                 else:
                     self._last_hr_str = "HR: —"
         hr_str = self._last_hr_str
+        self.hr_status_label.setText(hr_str)
 
         conn_icon = "🟢" if self.receiver.connected else "🔴"
         gain_str = f"Gain:x{self.receiver.current_gain}"
@@ -2318,8 +2338,7 @@ class ECGPlotWindow(QtWidgets.QMainWindow):
             f"Buf: {n_samples}/{RING_BUFFER_SAMPLES}   |   "
             f"Lat: {latency_ms:.1f}ms   |   "
             f"{jitter_str}   |   "
-            f"{gain_str}   |   "
-            f"{hr_str}"
+            f"{gain_str}"
         )
 
     def closeEvent(self, event):
